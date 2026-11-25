@@ -18,7 +18,6 @@ import {
   acceptAdminWithFreighter,
   setAccountOptionsWithFreighter,
   allowTrustWithFreighter,
-  readContractInstanceTtl,
   extendContractTtlWithFreighter,
   readContractTTL,
   extendCodeTTL,
@@ -78,6 +77,7 @@ import {
 import { validatePaymentAmount } from "./validatePaymentAmount";
 import { filterTransactionHistory } from "./txHistoryFilter";
 import { fetchHealth, fetchNetworkInfo } from "./api";
+import { readContractInstanceTtl } from "./contractInstanceTtl";
 import { decodeEnvelope, formatArgumentValue } from "./envelopeDecoder";
 import { formatSimulationFee } from "./simulationFees";
 import {
@@ -5637,10 +5637,13 @@ export default function App() {
                             Ledgers remaining
                           </span>
                           <span className="metadata-value">
-                            {ttlInfo.ledgersRemaining}
+                            {ttlInfo.ledgersRemaining ?? "—"}
                           </span>
                         </div>
                       </div>
+                      {ttlInfo.archived && (
+                        <p className="muted">{ttlInfo.message}</p>
+                      )}
                     </div>
                   )}
                   <form className="form" onSubmit={handleExtendTtl}>
