@@ -27,9 +27,11 @@ import {
   signChallengeWithFreighter,
   simulateRegisterBuilder,
   listKitewellBuilders,
+} from "./freighter";
+import {
   createSponsoredAccountDraft,
   sponsorAccountCreationWithFreighter,
-} from "./freighter";
+} from "./sponsoredAccountCreate";
 import {
   createFailedSubmitLog,
   downloadFailedSubmitLog,
@@ -367,6 +369,7 @@ export default function App() {
   // Sponsored account creation: draft XDR for the new account to co-sign.
   const [sponsorForm, setSponsorForm] = useState({
     newAccount: "",
+    startingBalance: "0",
     coSignedXdr: "",
   });
   const [sponsorDraft, setSponsorDraft] = useState(null);
@@ -2428,13 +2431,13 @@ export default function App() {
     setSponsorResult(null);
     setLoading("sponsor-draft");
     try {
-      const draft = await createSponsoredAccountDraft(
-        publicKey,
-        sponsorForm.newAccount
-      );
+      const draft = await createSponsoredAccountDraft(publicKey, {
+        newAccount: sponsorForm.newAccount,
+        startingBalance: sponsorForm.startingBalance,
+      });
       setSponsorDraft(draft);
       showToast(
-        "Unsigned sponsorship envelope ready. Have the new account sign it, then paste the signed XDR.",
+        "Review the three operations, then have the new account sign this exact XDR and paste it back.",
         "info"
       );
     } catch (err) {
@@ -2457,13 +2460,17 @@ export default function App() {
     setLoading("sponsor");
     setSponsorResult(null);
     try {
-      const result = await sponsorAccountCreationWithFreighter(
-        publicKey,
-        sponsorForm.newAccount,
-        sponsorForm.coSignedXdr.trim()
-      );
+      const result = await sponsorAccountCreationWithFreighter(publicKey, {
+        newAccount: sponsorForm.newAccount,
+        startingBalance: sponsorForm.startingBalance,
+        coSignedXdr: sponsorForm.coSignedXdr.trim(),
+      });
       setSponsorResult(result);
-      setSponsorForm({ newAccount: "", coSignedXdr: "" });
+      setSponsorForm({
+        newAccount: "",
+        startingBalance: "0",
+        coSignedXdr: "",
+      });
       setSponsorDraft(null);
       showToast(`Sponsored account created · ${result.hash.slice(0, 12)}…`);
       startTxWatch(result.hash);
@@ -5473,9 +5480,9 @@ export default function App() {
                   <div className="subhead">Sponsor a new account</div>
                   <p className="muted">
                     Creates the account and its reserve in one transaction:
-                    begin sponsoring, create the account with a starting balance of 0,
-                    then end sponsoring. The new key signs too, so both signatures are
-                    collected before submit.
+                    begin sponsoring, create the account with the starting balance
+                    below, then end sponsoring. The new key signs too, so both
+                    signatures are collected before submit.
                   </p>
                   <form className="form" onSubmit={handleSponsorAccount}>
                     <label className="label" htmlFor="sponsor-new-account">
@@ -5496,6 +5503,31 @@ export default function App() {
                       }}
                       required
                     />
+                    <label
+                      className="label"
+                      htmlFor="sponsor-starting-balance"
+                    >
+                      Starting balance (XLM)
+                    </label>
+                    <input
+                      id="sponsor-starting-balance"
+                      className="input"
+                      type="text"
+                      inputMode="decimal"
+                      placeholder="0"
+                      value={sponsorForm.startingBalance}
+                      onChange={(e) => {
+                        setSponsorForm({
+                          ...sponsorForm,
+                          startingBalance: e.target.value,
+                        });
+                        setSponsorDraft(null);
+                      }}
+                    />
+                    <p className="muted">
+                      Minimum 0 XLM: the sponsor covers the base reserve. A
+                      negative or malformed amount is refused.
+                    </p>
                     <button
                       className="btn btn--secondary"
                       type="button"
@@ -5517,6 +5549,15 @@ export default function App() {
                           Have the new account sign this exact XDR, then paste the
                           signed XDR below. Nothing has been submitted yet.
                         </p>
+                        <ol className="muted">
+                          {sponsorDraft.operations.map((operation) => (
+                            <li key={operation.step}>
+                              {operation.operation} · source{" "}
+                              {shortenAddress(operation.source)} —{" "}
+                              {operation.detail}
+                            </li>
+                          ))}
+                        </ol>
                         <textarea
                           className="input"
                           rows={4}
