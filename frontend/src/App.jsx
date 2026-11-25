@@ -78,6 +78,7 @@ import {
 import { validatePaymentAmount } from "./validatePaymentAmount";
 import { filterTransactionHistory } from "./txHistoryFilter";
 import { fetchHealth, fetchNetworkInfo } from "./api";
+import { checkRpcNetworkAgreement } from "./rpcNetworkCheck";
 import { decodeEnvelope, formatArgumentValue } from "./envelopeDecoder";
 import { formatSimulationFee } from "./simulationFees";
 import {
@@ -345,6 +346,9 @@ export default function App() {
   const [issuedTrustlines, setIssuedTrustlines] = useState([]);
   const [issuedTrustlinesError, setIssuedTrustlinesError] = useState(null);
 
+  // Issue #666: the passphrase the RPC reports, compared with the lab's.
+  const [rpcNetwork, setRpcNetwork] = useState(null);
+
   // Contract instance TTL + event tail in the Lab tab.
   const [ttlInfo, setTtlInfo] = useState(null);
   const [ttlError, setTtlError] = useState(null);
@@ -460,6 +464,10 @@ export default function App() {
   const selectedSendAsset = balances.find((b) => b.key === sendForm.assetKey);
   const selectedComposeAsset = balances.find((b) => b.key === composeForm.assetKey);
   const configuredContractId = labInfo?.network?.contract?.kitewell;
+  // Contract calls are disabled only once a check positively reported a
+  // disagreement (or that the network could not be checked). Classic Horizon
+  // payments never look at this flag.
+  const contractCallsBlocked = rpcNetwork?.contractCallsAllowed === false;
   const parsedBookPair = parseOrderBookPair(bookPair);
   const bookKey = JSON.stringify([networkId, bookPair.selling, bookPair.buying]);
   const currentBookResult = bookResult?.key === bookKey ? bookResult : null;
@@ -2022,6 +2030,17 @@ export default function App() {
   useEffect(() => {
     checkRpc();
   }, [checkRpc, networkId]);
+
+  // Read the passphrase the RPC reports whenever the network changes, so the
+  // lab can show it beside its own and refuse contract calls when they differ.
+  const checkRpcNetwork = useCallback(async () => {
+    setRpcNetwork(null);
+    setRpcNetwork(await checkRpcNetworkAgreement());
+  }, []);
+
+  useEffect(() => {
+    checkRpcNetwork();
+  }, [checkRpcNetwork, networkId]);
 
   const refreshLabState = useCallback(async () => {
     const contractId = labInfo?.network?.contract?.kitewell;
@@ -5147,6 +5166,47 @@ export default function App() {
                     </div>
                   )}
                   <div className="section__row">
+                    <div className="subhead">Network agreement</div>
+                    <button
+                      className="btn btn--secondary"
+                      type="button"
+                      onClick={checkRpcNetwork}
+                    >
+                      Recheck
+                    </button>
+                  </div>
+                  <div
+                    className={`info-box${contractCallsBlocked ? " info-box--warning" : ""}`}
+                  >
+                    <div className="metadata-grid">
+                      <div>
+                        <span className="metadata-label">Lab passphrase</span>
+                        <span className="metadata-value">
+                          {rpcNetwork?.labPassphrase ?? "checking…"}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="metadata-label">RPC passphrase</span>
+                        <span className="metadata-value">
+                          {rpcNetwork
+                            ? rpcNetwork.rpcPassphrase ?? "not reported"
+                            : "checking…"}
+                        </span>
+                      </div>
+                    </div>
+                    {rpcNetwork && <p className="muted">{rpcNetwork.message}</p>}
+                    {rpcNetwork?.error && (
+                      <p className="muted">{rpcNetwork.error}</p>
+                    )}
+                    {contractCallsBlocked && (
+                      <p className="muted">
+                        Contract calls in this tab are disabled. Classic Horizon
+                        payments are unaffected.
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="section__row">
                     <div className="subhead">On-chain registry</div>
                     <button
                       className="btn btn--secondary"
@@ -5234,7 +5294,9 @@ export default function App() {
                           <button
                             className="btn btn--primary"
                             type="submit"
-                            disabled={loading === "propose-admin"}
+                            disabled={
+                              loading === "propose-admin" || contractCallsBlocked
+                            }
                           >
                             {loading === "propose-admin" ? (
                               <>
@@ -5255,7 +5317,9 @@ export default function App() {
                             className="btn btn--primary"
                             type="button"
                             onClick={handleAcceptAdmin}
-                            disabled={loading === "accept-admin"}
+                            disabled={
+                              loading === "accept-admin" || contractCallsBlocked
+                            }
                           >
                             {loading === "accept-admin" ? (
                               <>
@@ -5381,6 +5445,7 @@ export default function App() {
                         loading === "register" ||
                         loading === "simulate" ||
                         requireWallet ||
+                        contractCallsBlocked ||
                         !registerSimulationReady
                       }
                     >
@@ -5399,7 +5464,8 @@ export default function App() {
                       disabled={
                         loading === "simulate" ||
                         loading === "register" ||
-                        requireWallet
+                        requireWallet ||
+                        contractCallsBlocked
                       }
                     >
                       {loading === "simulate" ? (
@@ -5670,6 +5736,7 @@ export default function App() {
                       disabled={
                         loading === "ttl-extend" ||
                         requireWallet ||
+                        contractCallsBlocked ||
                         !configuredContractId ||
                         !ttlInfo ||
                         !ttlForm.extendTo
