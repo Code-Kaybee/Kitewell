@@ -8,8 +8,8 @@ import {
   isFriendbotAvailable,
   NETWORKS,
 } from "./network";
-import { calculateMinimumBalance } from "./accountReserve";
 import { paymentMemoFields } from "./paymentMemo";
+import { mapTransactionFee } from "./historyFee";
 
 /** Shown in the lab panel when Horizon asks the client to slow down. */
 export const HORIZON_SLOWDOWN_MESSAGE =
@@ -119,7 +119,6 @@ export async function getLatestLedger(networkId = getActiveNetworkId()) {
   const sequence = Number(ledger.sequence);
   const closedAt = Date.parse(ledger.closed_at);
   const baseFee = String(ledger.base_fee_in_stroops ?? "");
-  const baseReserve = String(ledger.base_reserve_in_stroops ?? "");
   if (!Number.isSafeInteger(sequence) || sequence < 1) {
     throw new Error("Latest ledger has an invalid sequence.");
   }
@@ -668,15 +667,6 @@ export function calculateAvailableBalance(
   return Math.max(0, total - sellingLiabilities).toFixed(7);
 }
 
-function liabilityFields(balance, isNative, subentryCount, baseReserve) {
-  const sellingLiabilities = parseFloat(balance.selling_liabilities || "0");
-  const buyingLiabilities = parseFloat(balance.buying_liabilities || "0");
-  return {
-    sellingLiabilities: sellingLiabilities.toFixed(7),
-    buyingLiabilities: buyingLiabilities.toFixed(7),
-    available: calculateAvailableBalance(balance, isNative, subentryCount, baseReserve),
-  };
-}
 
 /**
  * Hide only idle, zero-balance credit trustlines. Native XLM, pool shares and
@@ -696,8 +686,9 @@ export function filterVisibleBalances(balances, hideZeroCreditAssets = false) {
   });
 }
 
+let baseReserve = 0.5;
+
 async function readBaseReserve() {
-  let baseReserve = 0.5;
   try {
     if (getServer().ledgers) {
       const ledgerInfo = await getServer().ledgers().order("desc").limit(1).call();
@@ -712,11 +703,13 @@ async function readBaseReserve() {
 }
 
 function mapHorizonBalances(account, baseReserve = 0.5) {
-  const subentryCount = account.subentry_count || 0;
+  const subentryCount = account.subentry_count ?? 0;
   return account.balances.map((b) => {
     const sellingLiabilities = b.selling_liabilities ?? "0";
     const buyingLiabilities = b.buying_liabilities ?? "0";
-    if (b.asset_type === "native") {
+    const isNative = b.asset_type === "native";
+    const available = calculateAvailableBalance(b, isNative, subentryCount, baseReserve);
+    if (isNative) {
       return {
         key: "native",
         code: "XLM",
@@ -726,6 +719,7 @@ function mapHorizonBalances(account, baseReserve = 0.5) {
         isNative: true,
         sellingLiabilities,
         buyingLiabilities,
+        available,
       };
     }
     return {
@@ -737,6 +731,7 @@ function mapHorizonBalances(account, baseReserve = 0.5) {
       isNative: false,
       sellingLiabilities,
       buyingLiabilities,
+      available,
     };
   });
 }
@@ -825,7 +820,6 @@ export async function getAccountDetails(publicKey) {
     subentryCount: account.subentry_count,
     lastModifiedLedger: account.last_modified_ledger ?? null,
     thresholds: account.thresholds,
-    signers: account.signers,
     balances: mapHorizonBalances(account),
     dataEntries: mapAccountDataEntries(account),
     signers: account.signers || [],
@@ -1412,3 +1406,12 @@ export async function getAccountTrades(publicKey, { limit = 10, cursor } = {}) {
 }
 
 export { summarizeEnvelopeSignatures } from "./multisigEnvelope";
+
+// --- grafted module declarations ---
+function mapOrderBookRows(rows = []) {
+  return rows.slice(0, 10).map((row) => ({
+    amount: row.amount,
+    price: row.price,
+    priceR: row.price_r,
+  }));
+}
