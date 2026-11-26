@@ -1,21 +1,26 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import {useState, useCallback, useEffect, useRef, } from "react";
 import * as StellarSdk from "@stellar/stellar-sdk";
-import {
-  checkFreighterInstalled,
+import { createTxLog } from "./txLog";
+import { minimumBalanceInStroops } from "./accountReserve";
+import {checkFreighterInstalled,
   connectFreighterWallet,
   buildPaymentEnvelope,
   buildUnsignedEnvelope,
   submitEnvelopeWithFreighter,
   pathPaymentWithFreighter,
-  changeOfferPriceWithFreighter,
+  
   changeTrustWithFreighter,
-  createClaimableBalanceWithFreighter,
-  claimClaimableBalanceWithFreighter,
+  
+  
+  clawbackClaimableBalanceWithFreighter,
+  
   readKitewellState,
   registerBuilderWithFreighter,
   readAdminState,
   proposeAdminWithFreighter,
   acceptAdminWithFreighter,
+  getServer,
+  currentPassphrase,
   setAccountOptionsWithFreighter,
   allowTrustWithFreighter,
   readContractInstanceTtl,
@@ -27,30 +32,35 @@ import {
   signChallengeWithFreighter,
   simulateRegisterBuilder,
   listKitewellBuilders,
-} from "./freighter";
-import {
+  readKitewellBuilder,
   createSponsoredAccountDraft,
-  sponsorAccountCreationWithFreighter,
-} from "./sponsoredAccountCreate";
+  sponsorAccountCreationWithFreighter, preparePaymentWithFreighter, confirmPaymentWithFreighter, createAccountWithFreighter, parseSep7PayUri, checkSorobanRpcHealth, TRANSACTION_FEE_STROOPS, deployKitewellContract, } from "./freighter";
+import {
+  appendBuilderPage,
+  isBuilderCountMismatch,
+} from "./builderDirectory";
 import {
   createFailedSubmitLog,
   downloadFailedSubmitLog,
 } from "./failedSubmitLog";
 import { copyToClipboardResult } from "./copyToClipboardResult";
-import { shortenAddress } from "./addressFormat";
-import {
-  fundWithFriendbot,
-  buildAsset,
+import {shortenAddress, splitMuxedAddress, buildMuxedAddress } from "./addressFormat";
+import { generateAddressQrCode } from "./addressQr";
+import {fundWithFriendbot,
+  
   getAccountBalances,
   getAccountDetails,
   getOpenOffers,
   getPendingTransactions,
-  getClaimableBalances,
+  getSponsoredClaimableBalances,
+  getAccountTrades,
+  isHorizonSlowdownError,
+  HORIZON_SLOWDOWN_MESSAGE,
   getLiquidityPool,
   liquidityPoolDeposit,
   liquidityPoolWithdraw,
   getTransactions,
-  groupPaymentsByDay,
+  
   explorerAccountUrl,
   explorerTxUrl,
   downloadAccountSnapshot,
@@ -58,13 +68,13 @@ import {
   getIssuedAssetTrustlines,
   accountLedgerStatus,
   IMMUTABLE_CONFIRMATION,
-  getTransactionMemos,
-  buildPaymentsCsv,
-  PAYMENTS_CSV_FILENAME,
-} from "./stellar";
+  
+  
+  watchOfferUntilGone, filterVisibleBalances, resolveFederationAddress, getAccountOffers, buildManageSellOffer, getFeeStats, getOrderBook, getLatestBaseReserve } from "./stellar";
 import { downloadCsv } from "./csvExport";
+import { buildersToCsv } from "./builderCsv";
 import {
-  clearStoredOrderBookPair,
+  
   parseOrderBookPair,
   readStoredOrderBookPair,
   saveOrderBookPair,
@@ -73,17 +83,23 @@ import { poolShareRows } from "./poolShare";
 import {
   calculateMinimumBalance,
   formatStroops,
-  minimumBalanceInStroops,
-  parseXlmToStroops,
-  remainsAboveMinimum,
+  
+  
+  
 } from "./accountReserve";
 import { validatePaymentAmount } from "./validatePaymentAmount";
 import { filterTransactionHistory } from "./txHistoryFilter";
-import { fetchHealth, fetchNetworkInfo } from "./api";
+import {fetchHealth, fetchNetworkInfo, fetchLatestHorizonLedger } from "./api";
+import {
+  describeEndSponsorship,
+  endSponsorshipWithFreighter,
+  hasEndSponsorshipAction,
+} from "./sponsorshipRevoke";
 import { decodeEnvelope, formatArgumentValue } from "./envelopeDecoder";
 import { formatSimulationFee } from "./simulationFees";
+import { mapPaymentMemo } from "./paymentMemo";
 import {
-  NETWORKS,
+  
   getActiveNetwork,
   getActiveNetworkId,
   getAvailableNetworks,
@@ -98,16 +114,26 @@ import { decodeTransactionEnvelope } from "./txInspector";
 import TransactionHashLookup from "./TransactionHashLookup";
 import SigningPassphraseConfirmation from "./SigningPassphraseConfirmation";
 import MultisigCosignPanel from "./MultisigCosignPanel";
+import LabAdminPanel from "./LabAdminPanel";
 import { completeWebAuthChallenge } from "./sep10WebAuth";
 import { loadIssuerCurrencyList } from "./issuerToml";
-import { createPaymentStreamController } from "./paymentStream";
 import {
   normaliseTxHash,
   txStatusPresentation,
   watchTransactionStatus,
 } from "./txStatusWatch";
 import { buildTransactionExplorerUrl } from "./explorerLink";
+import {
+  canCallContract,
+  contractStatusLabel,
+  resolveContractStatus,
+  rpcCallBlockReason,
+} from "./contractStatus";
 import "./App.css";
+import { formatHistoryFee } from "./historyFee";
+import { TransactionFailureNotice } from "./TransactionFailureNotice";
+import {saveFeeSetting, loadFeeSetting } from "./feeSetting";
+import { createSubmitGuard } from "./submitGuard";
 
 const TABS = [
   "Wallet",
@@ -179,10 +205,19 @@ function validatePositivePrice(value, label) {
   return text;
 }
 
+
+// --- grafted module declarations ---
+const FEE_PERCENTILES = [
+  { key: "mode", label: "Mode" },
+  { key: "p10", label: "p10" },
+  { key: "p99", label: "p99" },
+];
+
 export default function App() {
   const [activeTab, setActiveTab] = useState("Wallet");
   const [publicKey, setPublicKey] = useState(null);
   const [networkId, setNetworkId] = useState(getActiveNetworkId());
+  const [qrCodeDataUrl, setQrCodeDataUrl] = useState(null);
   const [customNetworkForm, setCustomNetworkForm] = useState({
     name: "",
     horizonUrl: "",
@@ -208,8 +243,10 @@ export default function App() {
     minAmountB: "",
   });
   const [transactions, setTransactions] = useState([]);
-  const [pendingTransactions, setPendingTransactions] = useState([]);
-  const [pendingError, setPendingError] = useState(null);
+  const [, setPendingTransactions] = useState([]);
+  const [trades, setTrades] = useState([]);
+  const [tradesNextCursor, setTradesNextCursor] = useState(null);
+  const [, setPendingError] = useState(null);
   const [nextCursor, setNextCursor] = useState(null);
   const [pageCursors, setPageCursors] = useState([null]);
   const [historyFilters, setHistoryFilters] = useState({
@@ -237,6 +274,9 @@ export default function App() {
       ...changes,
     }));
     setSendPrepared(null);
+    // Any edit changes the operation list, so the previewed envelope is stale.
+    setUnsignedEnvelope(null);
+    setSigningConfirmationOpen(false);
   };
   const [trustForm, setTrustForm] = useState({ code: "", issuer: "", limit: "1000000" });
   const [createAccountForm, setCreateAccountForm] = useState({
@@ -278,11 +318,13 @@ export default function App() {
   const [simulatedRegisterKey, setSimulatedRegisterKey] = useState(null);
   const [labState, setLabState] = useState(null);
   const [labStateError, setLabStateError] = useState(null);
+  const [builderAddress, setBuilderAddress] = useState("");
+  const [builderLookupResult, setBuilderLookupResult] = useState(null);
+  const [builderLookupError, setBuilderLookupError] = useState(null);
   const [adminState, setAdminState] = useState(null);
   const [proposeAdminForm, setProposeAdminForm] = useState({ address: "" });
   const [registerForm, setRegisterForm] = useState({ name: "" });
   const [lastRegisterTx, setLastRegisterTx] = useState(null);
-  const [renameForm, setRenameForm] = useState({ name: "" });
   const [inspectForm, setInspectForm] = useState({ xdr: "" });
   const [inspectResult, setInspectResult] = useState(null);
   const [inspectError, setInspectError] = useState(null);
@@ -294,15 +336,7 @@ export default function App() {
   const tabRefs = useRef([]);
   const horizonAbortRef = useRef(null);
   const [accountDetails, setAccountDetails] = useState(null);
-  const [claimableForm, setClaimableForm] = useState({
-    claimant: "",
-    amount: "",
-    assetKey: "native",
-    predicateMode: "unconditional",
-    ledgerTime: "",
-  });
-  const [claimableBalances, setClaimableBalances] = useState([]);
-  const [claimableResult, setClaimableResult] = useState(null);
+  const [, setClawbackAssets] = useState([]);
   const [failedSubmits, setFailedSubmits] = useState([]);
   const failedSubmitLogRef = useRef(createFailedSubmitLog());
   const [webAuthForm, setWebAuthForm] = useState({ endpoint: "", serverAccount: "" });
@@ -311,28 +345,17 @@ export default function App() {
   const [issuerInput, setIssuerInput] = useState("");
   const [issuerResult, setIssuerResult] = useState(null);
   const [issuerError, setIssuerError] = useState(null);
-  const [streamedPayments, setStreamedPayments] = useState([]);
-  const [streamState, setStreamState] = useState(null);
+  const [streamedPayments, ] = useState([]);
+  const [streamState, ] = useState(null);
   const [txWatch, setTxWatch] = useState(null);
   const [txWatchError, setTxWatchError] = useState(null);
   const [hashForm, setHashForm] = useState("");
   const [hashError, setHashError] = useState(null);
-  const streamSessionRef = useRef(null);
   const watchTokenRef = useRef(0);
 
   // Issue #512: the controller owns the streamed payments and their paging
   // tokens, so a duplicate event can never reach the list twice; this only
   // mirrors its state into React.
-  const paymentStream = useMemo(
-    () =>
-      createPaymentStreamController({
-        onChange: (records, state) => {
-          setStreamedPayments(records);
-          setStreamState(state);
-        },
-      }),
-    []
-  );
 
   // Issuer auth flags + trustlines the connected account issued.
   const [issuerConfig, setIssuerConfig] = useState(null);
@@ -375,8 +398,17 @@ export default function App() {
   const [sponsorDraft, setSponsorDraft] = useState(null);
   const [sponsorResult, setSponsorResult] = useState(null);
 
+  // Issue #668: ending one sponsorship from the list.
+  const [endSponsorForm, setEndSponsorForm] = useState({
+    sponsoredAccount: "",
+    assetCode: "",
+    assetIssuer: "",
+  });
+  const [endSponsorConfirmation, setEndSponsorConfirmation] = useState(null);
+  const [endSponsorResult, setEndSponsorResult] = useState(null);
+
   // One offer watch at a time; aborting the controller only stops polling.
-  const [offerForm, setOfferForm] = useState("");
+  const [offerWatchId, setOfferWatchId] = useState("");
   const [offerWatch, setOfferWatch] = useState(null);
   const [offerWatchError, setOfferWatchError] = useState(null);
   const offerWatchRef = useRef(null);
@@ -452,20 +484,18 @@ export default function App() {
     setPathForm((prev) => ({ ...prev, ...changes }));
     // Editing the request invalidates any quote from the previous form state.
     setPathQuote(null);
-  const updatePathForm = (changes) => setPathForm((prev) => ({ ...prev, ...changes }));
-  const updateOfferForm = (changes) => setOfferForm((prev) => ({ ...prev, ...changes }));
-  // Any edit changes the operation list, so the previewed envelope is stale.
-  const updateSendForm = (changes) => {
-    setSendForm((prev) => ({ ...prev, ...changes }));
-    setUnsignedEnvelope(null);
-    setSigningConfirmationOpen(false);
   };
   const selectedSendAsset = balances.find((b) => b.key === sendForm.assetKey);
-  const selectedComposeAsset = balances.find((b) => b.key === composeForm.assetKey);
   const configuredContractId = labInfo?.network?.contract?.kitewell;
-  const parsedBookPair = parseOrderBookPair(bookPair);
+  // The Lab must know whether the instance entry is live or archived before it
+  // offers an RPC call: an archived instance fails every invocation.
+  const contractStatus = resolveContractStatus({
+    contractId: configuredContractId,
+    state: labState,
+    error: labStateError,
+  });
+  const contractCallBlock = rpcCallBlockReason(contractStatus);
   const bookKey = JSON.stringify([networkId, bookPair.selling, bookPair.buying]);
-  const currentBookResult = bookResult?.key === bookKey ? bookResult : null;
 
   useEffect(() => {
     if (activeTab !== "Book") return;
@@ -487,14 +517,6 @@ export default function App() {
     return () => { cancelled = true; };
   }, [activeTab, bookPair, bookKey]);
 
-  const getOfferAsset = (side) => {
-    const type = offerForm[`${side}Type`];
-    return buildAsset({
-      isNative: type === "native",
-      code: offerForm[`${side}Code`],
-      issuer: offerForm[`${side}Issuer`],
-    });
-  };
 
   useEffect(() => {
     checkFreighterInstalled().then(setFreighterInstalled);
@@ -525,7 +547,7 @@ export default function App() {
         if (!cancelled) setOfferLoading(false);
       });
     return () => { cancelled = true; };
-  }, [activeTab, publicKey, networkId, offerRefresh]);
+  }, [activeTab, publicKey, networkId]);
 
   // A pool-share balance only says how many shares the account holds. Load
   // each pool so the panel can also show both reserves and the total shares.
@@ -565,9 +587,22 @@ export default function App() {
       const newWeights = signers.map(() => 0);
       setSignerWeights(newWeights);
     }
-  }, [signers.length, signerWeights.length]);
+  }, [signers, signerWeights]);
 
-  const refreshBalances = useCallback(async () => {
+  const refreshReserve = useCallback(async () => {
+    try {
+      const baseReserve = await getLatestBaseReserve();
+      setBaseReserveInStroops(baseReserve);
+      setReserveError(null);
+    } catch (error) {
+      setBaseReserveInStroops(null);
+      setReserveError(
+        error.message || "Could not load the latest ledger reserve from Horizon."
+      );
+    }
+  }, []);
+
+const refreshBalances = useCallback(async () => {
     if (!publicKey) return;
     setLoading("balance");
     const signal = beginHorizonRead();
@@ -575,7 +610,7 @@ export default function App() {
       const next = await getAccountBalances(publicKey, { signal });
       setBalances(next);
       setHorizonNotice(null);
-      const claimables = await getClaimableBalances(publicKey).catch(() => []);
+      const claimables = await getSponsoredClaimableBalances(publicKey).catch(() => []);
       setClaimableBalances(claimables);
       try {
         const details = await getAccountDetails(publicKey, { signal });
@@ -594,12 +629,12 @@ export default function App() {
         if (isHorizonSlowdownError(detailsError)) {
           setHorizonNotice(HORIZON_SLOWDOWN_MESSAGE);
           showToast(HORIZON_SLOWDOWN_MESSAGE, "info");
+        } else {
+          setAccountDetails(null);
         }
-      } catch {
-        setAccountDetails(null);
       }
       await refreshReserve();
-    } catch {
+    } catch (error) {
       setBalances([]);
       setClaimableBalances([]);
       if (isHorizonSlowdownError(error)) {
@@ -612,14 +647,14 @@ export default function App() {
     } finally {
       setLoading("");
     }
-  }, [activeNetwork, publicKey]);
+  }, [activeNetwork, publicKey, refreshReserve]);
 
-  const handleClawback = async (balance) => {
+  const handleClawbackClaimable = async (balance) => {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
     setLoading(`clawback-${balance.id}`);
     try {
       await clawbackClaimableBalanceWithFreighter(publicKey, balance.id);
-      const next = await getClaimableBalances(publicKey).catch(() => []);
+      const next = await getSponsoredClaimableBalances(publicKey).catch(() => []);
       setClaimableBalances(next);
       showToast(`${balance.code} claimable balance clawed back.`);
     } catch (err) {
@@ -630,207 +665,12 @@ export default function App() {
     }
   };
 
-  const refreshAccountDetails = async () => {
-    if (!publicKey) return;
-    try {
-      setAccountDetails(await getAccountDetails(publicKey));
-    } catch {
-      setAccountDetails(null);
-    }
-  };
 
-  const handleSetData = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!dataForm.name) return showToast("Data name is required.", "error");
 
-    setLoading("data-set");
-    try {
-      await manageDataWithFreighter(publicKey, dataForm.name, dataForm.value);
-      setDataForm({ name: "", value: "" });
-      await refreshAccountDetails();
-      showToast("Account data submitted.");
-    } catch (err) {
-      showToast(err.message || "Could not set account data.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
 
-  const handleClearData = async (name) => {
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    setLoading(`data-clear-${name}`);
-    try {
-      await manageDataWithFreighter(publicKey, name, null);
-      await refreshAccountDetails();
-      showToast(`Cleared account data "${name}".`);
-    } catch (err) {
-      showToast(err.message || `Could not clear "${name}".`, "error");
-    } finally {
-      setLoading("");
-    }
-  };
 
-  const refreshAccountDetails = async () => {
-    if (!publicKey) return;
-    try {
-      setAccountDetails(await getAccountDetails(publicKey));
-    } catch {
-      setAccountDetails(null);
-    }
-  };
 
-  const handleSetData = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!dataForm.name) return showToast("Data name is required.", "error");
-    setLoading("data-set");
-    try {
-      await manageDataWithFreighter(publicKey, dataForm.name, dataForm.value);
-      setDataForm({ name: "", value: "" });
-      await refreshAccountDetails();
-      showToast("Account data submitted.");
-    } catch (err) {
-      showToast(err.message || "Could not set account data.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
 
-  const handleClearData = async (name) => {
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    setLoading(`data-clear-${name}`);
-    try {
-      await manageDataWithFreighter(publicKey, name, null);
-      await refreshAccountDetails();
-      showToast(`Cleared account data "${name}".`);
-    } catch (err) {
-      showToast(err.message || `Could not clear "${name}".`, "error");
-    } finally {
-      setLoading("");
-    }
-  };
-
-  const handleMergeAccount = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    setLoading("merge");
-    try {
-      const result = await mergeAccountWithFreighter(
-        publicKey,
-        mergeForm.destination,
-        mergeForm.retypeDestination
-      );
-      showToast(
-        `Account merge submitted · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-      setPublicKey(null);
-      setBalances([]);
-      setTransactions([]);
-      setAccountDetails(null);
-      setMergeForm({ destination: "", retypeDestination: "" });
-    } catch (err) {
-      showToast(err.message || "Account merge failed.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
-
-  const handleClaimableRefresh = useCallback(async () => {
-    if (!publicKey) return;
-    setLoading("claimable-list");
-    try {
-      setClaimableBalances(await getClaimableBalances(publicKey));
-    } catch (err) {
-      setClaimableBalances([]);
-      showToast(err.message || "Could not load claimable balances.", "error");
-    } finally {
-      setLoading("");
-    }
-  }, [publicKey]);
-
-  const handleCreateClaimable = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!claimableForm.claimant) {
-      return showToast("Claimant is required.", "error");
-    }
-    const selected = balances.find((b) => b.key === claimableForm.assetKey);
-    if (!selected) return showToast("Choose an asset you hold.", "error");
-    if (parseFloat(claimableForm.amount) > parseFloat(selected.balance)) {
-      return showToast(
-        `Insufficient ${selected.code} balance. Available: ${selected.balance}.`,
-        "error"
-      );
-    }
-    setLoading("claimable-create");
-    setClaimableResult(null);
-    try {
-      const asset = selected.isNative
-        ? { isNative: true }
-        : { isNative: false, code: selected.code, issuer: selected.issuer };
-      const result = await createClaimableBalanceWithFreighter({
-        publicKey,
-        claimant: claimableForm.claimant,
-        amount: claimableForm.amount,
-        asset,
-        predicateMode: claimableForm.predicateMode,
-        ledgerTime: claimableForm.ledgerTime,
-      });
-      setClaimableResult({ type: "created", hash: result.hash });
-      setClaimableForm({
-        claimant: "",
-        amount: "",
-        assetKey: "native",
-        predicateMode: "unconditional",
-        ledgerTime: "",
-      });
-      try {
-        setBalances(await getAccountBalances(publicKey));
-      } catch {
-        /* balances refresh separately */
-      }
-      showToast(
-        `Claimable balance created · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-    } catch (err) {
-      showToast(err.message || "Could not create claimable balance.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
-
-  const handleClaimClaimable = async (balance) => {
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    setLoading(`claimable-${balance.id}`);
-    try {
-      const result = await claimClaimableBalanceWithFreighter(publicKey, balance.id);
-      setClaimableResult({
-        type: "claimed",
-        hash: result.hash,
-        balanceId: balance.id,
-      });
-      await handleClaimableRefresh();
-      try {
-        setBalances(await getAccountBalances(publicKey));
-      } catch {
-        /* balances refresh separately */
-      }
-      showToast(
-        `Claimable balance claimed · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-    } catch (err) {
-      showToast(err.message || "Could not claim balance.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
 
   const handleConnect = async () => {
     setLoading("connect");
@@ -838,6 +678,8 @@ export default function App() {
       const address = await connectFreighterWallet();
       submitGuardRef.current.reset();
       setPublicKey(address);
+      // Generate a scannable QR code for the connected public address.
+      setQrCodeDataUrl(await generateAddressQrCode(address));
       setBalances([]);
       setOpenOffers([]);
       setOfferPrices({});
@@ -874,6 +716,8 @@ export default function App() {
     failedSubmitLogRef.current.clear();
     setFailedSubmits([]);
     setPublicKey(null);
+    setQrCodeDataUrl(null);
+    setQrCodeDataUrl(null);
     setBalances([]);
     setOpenOffers([]);
     setOfferPrices({});
@@ -949,6 +793,38 @@ export default function App() {
     setNetworkId(network.id);
     setCustomNetworkForm({ name: "", horizonUrl: "", rpcUrl: "", passphrase: "" });
     showToast("Custom network removed. Switched to Testnet.", "info");
+  };
+
+  const loadTrades = async (cursor) => {
+    const page = await getAccountTrades(publicKey, cursor ? { cursor } : {});
+    setTrades((previous) => (cursor ? [...previous, ...page.records] : page.records));
+    setTradesNextCursor(page.nextCursor);
+  };
+
+  const handleTrades = async () => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading("trades");
+    try {
+      await loadTrades();
+    } catch (err) {
+      setTrades([]);
+      setTradesNextCursor(null);
+      showToast(err.message || "Could not load trades.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleLoadMoreTrades = async () => {
+    if (!publicKey || !tradesNextCursor) return;
+    setLoading("trades-more");
+    try {
+      await loadTrades(tradesNextCursor);
+    } catch (err) {
+      showToast(err.message || "Could not load more trades.", "error");
+    } finally {
+      setLoading("");
+    }
   };
 
   const refreshPending = useCallback(async () => {
@@ -1048,6 +924,7 @@ export default function App() {
       return showToast(err.message, "error");
     }
     setTransactionFailure(null);
+    const limit = trustForm.limit;
     setLoading("trust");
     try {
       const result = await changeTrustWithFreighter(
@@ -1072,45 +949,6 @@ export default function App() {
     }
   };
 
-  const handleIssue = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-
-    let code;
-    let amount;
-    try {
-      code = validateAssetCode(issueForm.code);
-      amount = validatePaymentAmount(issueForm.amount, "Issuance amount");
-    } catch (err) {
-      return showToast(err.message, "error");
-    }
-
-    if (!issueForm.destination.trim()) {
-      return showToast("Holder account is required.", "error");
-    }
-
-    setLoading("issue");
-    try {
-      const result = await sendPaymentWithFreighter(
-        publicKey,
-        issueForm.destination.trim(),
-        amount,
-        { isNative: false, code, issuer: publicKey }
-      );
-      setIssueForm({ code: "", destination: "", amount: "" });
-      showToast(
-        `Issued ${amount} ${code} · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-      startTxWatch(result.hash);
-    } catch (err) {
-      trackFailedSubmit("issue", err);
-      showToast(err.message || "Issue failed.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
 
   const handleChangeLimit = async (asset) => {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
@@ -1164,6 +1002,7 @@ export default function App() {
     }
 
     setTransactionFailure(null);
+    const guardKey = `remove-${asset.key}`;
     setLoading(`remove-${asset.key}`);
     try {
       const result = await changeTrustWithFreighter(publicKey, asset.code, asset.issuer, "0");
@@ -1307,16 +1146,22 @@ export default function App() {
       return showToast(err.message || "Federation lookup failed.", "error");
     }
 
+    const sendArgs = sendFormArgs();
+    if (!sendArgs) {
+      setLoading("");
+      return;
+    }
+
     try {
       const prepared = await preparePaymentWithFreighter(
         publicKey,
         paymentDestination,
-        amount,
-        asset,
+        sendArgs.amount,
+        sendArgs.asset,
         sendForm.memoType,
         sendForm.memo,
-        minTime,
-        maxTime
+        sendForm.minTime,
+        sendForm.maxTime
       );
       setSendPrepared(prepared);
       showToast("Payment prepared. Confirm in Freighter.");
@@ -1493,114 +1338,8 @@ export default function App() {
     }
   };
 
-  const handleClawback = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
 
-    const asset = clawbackAssets.find(
-      (candidate) => candidate.key === clawbackForm.assetKey
-    );
-    if (!asset) {
-      return showToast(
-        "Choose an asset you issue with clawback enabled.",
-        "error"
-      );
-    }
-    if (!clawbackForm.holder || !clawbackForm.amount) {
-      return showToast("Holder and amount are required.", "error");
-    }
 
-    const gate = submitGuardRef.current.begin(
-      "clawback",
-      `${asset.key}|${clawbackForm.holder}|${clawbackForm.amount}`
-    );
-    if (!gate.allowed) return;
-
-    setLoading("clawback");
-    try {
-      const result = await clawbackWithFreighter(
-        publicKey,
-        clawbackForm.holder,
-        asset.code,
-        asset.issuer,
-        clawbackForm.amount
-      );
-      trackSubmission(result.hash, "clawback");
-      setClawbackForm((previous) => ({
-        ...previous,
-        holder: "",
-        amount: "",
-      }));
-      showToast(
-        `Clawback submitted · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-    } catch (err) {
-      showToast(err.message || "Clawback failed.", "error");
-    } finally {
-      submitGuardRef.current.end("clawback");
-      setLoading("");
-    }
-  };
-
-  const handleSponsor = async (e) => {
-    e.preventDefault();
-    if (!publicKey) return showToast("Connect Freighter first.", "error");
-    if (!sponsorForm.sponsoredAccount) {
-      return showToast("Sponsored account is required.", "error");
-    }
-    if (!sponsorForm.code || !sponsorForm.issuer) {
-      return showToast("Asset code and issuer are required.", "error");
-    }
-
-    const gate = submitGuardRef.current.begin(
-      "sponsor",
-      `${sponsorForm.sponsoredAccount}|${sponsorForm.code}|${sponsorForm.issuer}`
-    );
-    if (!gate.allowed) return;
-
-    setLoading("sponsor");
-    try {
-      const result = await sponsorTrustlineWithFreighter({
-        publicKey,
-        sponsoredAccount: sponsorForm.sponsoredAccount,
-        assetCode: sponsorForm.code,
-        assetIssuer: sponsorForm.issuer,
-      });
-      trackSubmission(result.hash, "sponsorTrustline");
-      setSponsorForm({ sponsoredAccount: "", code: "", issuer: "" });
-      showToast(
-        `Sponsored trustline submitted · ${result.hash.slice(0, 12)}…`,
-        "success",
-        explorerTxUrl(result.hash)
-      );
-    } catch (err) {
-      showToast(err.message || "Sponsored trustline failed.", "error");
-    } finally {
-      submitGuardRef.current.end("sponsor");
-      setLoading("");
-    }
-  };
-
-  const handleOrderBook = async (e) => {
-    e.preventDefault();
-    setLoading("order-book");
-    setOrderBookError(null);
-    setOrderBook(null);
-    try {
-      const book = await getOrderBook(getOfferAsset("selling"), getOfferAsset("buying"));
-      setOrderBook(book);
-    } catch (error) {
-      setOrderBookError(
-        error.message === "Selling and buying assets must be different."
-          ? error.message
-          : "The order book could not be read. Try again in a moment."
-      );
-    } finally {
-      setLoading("");
-    }
-  };
 
   const refreshOfferData = async () => {
     const [nextBalances, nextOffers] = await Promise.all([
@@ -2040,6 +1779,7 @@ export default function App() {
     // unaffected: classic payments only need the Horizon server, not the RPC.
     if (!rpcHealth.ok) {
       setLabState(null);
+      setAdminState(null);
       setLabStateError(
         rpcHealth.error ||
           `Soroban RPC unreachable (${rpcHealth.description}). ` +
@@ -2050,6 +1790,7 @@ export default function App() {
 
     setLoading("labstate");
     setLabStateError(null);
+    setAdminState(null);
     try {
       // Always read builder state
       const state = await readKitewellState(contractId, publicKey);
@@ -2074,6 +1815,29 @@ export default function App() {
       setLoading("");
     }
   }, [labInfo, publicKey, rpcHealth]);
+
+  const handleBuilderLookup = async (e) => {
+    e.preventDefault();
+    const contractId = labInfo?.network?.contract?.kitewell;
+    setBuilderLookupResult(null);
+    setBuilderLookupError(null);
+    if (!contractId) {
+      setBuilderLookupError(
+        "No contract id configured — deploy first (contracts/README.md)."
+      );
+      return;
+    }
+    setLoading("builder-lookup");
+    try {
+      setBuilderLookupResult(
+        await readKitewellBuilder(contractId, builderAddress)
+      );
+    } catch (err) {
+      setBuilderLookupError(err.message || "Builder lookup failed.");
+    } finally {
+      setLoading("");
+    }
+  };
 
   const handleRegister = async (e) => {
     e.preventDefault();
@@ -2148,7 +1912,6 @@ export default function App() {
   // Handle remove signer
   const handleRemoveSigner = (index) => {
     // Check if removing this signer would lock out the high threshold
-    const currentSignerWeight = signerWeights[index] ?? 0;
     const remainingWeight = signerWeights.filter((_, i) => i !== index).reduce((sum, w) => sum + (w ?? 0), 0);
     if (remainingWeight < highThreshold && signers.length > 1) {
       if (!window.confirm(
@@ -2184,7 +1947,6 @@ export default function App() {
     if (!publicKey) return showToast("Connect Freighter first.", "error");
 
     // Build the setOptions operation with the edited values
-    const operations = [];
 
     // Build the setOptions params
     const setOptionsParams = {
@@ -2396,10 +2158,9 @@ export default function App() {
     }
   };
 
-  // Issue #571: page through the contract's builder index. A page past the
-  // end comes back empty, so the panel shows an empty page rather than an error.
+  // Issue #643: append fixed-size pages from the contract's builder index.
   const loadBuilderPage = useCallback(
-    async (start = 0, explicitContractId) => {
+    async (start = 0, explicitContractId, append = false) => {
       const contractId = explicitContractId ?? configuredContractId;
       if (!contractId) {
         setBuilderList(null);
@@ -2409,9 +2170,12 @@ export default function App() {
       setLoading("builders");
       setBuilderListError(null);
       try {
-        setBuilderList(await listKitewellBuilders(contractId, { start }));
+        const page = await listKitewellBuilders(contractId, { start });
+        setBuilderList((previous) =>
+          appendBuilderPage(previous, { ...page, start }, contractId)
+        );
       } catch (err) {
-        setBuilderList(null);
+        if (!append) setBuilderList(null);
         setBuilderListError(
           err.message || "Could not read the builder index."
         );
@@ -2482,6 +2246,49 @@ export default function App() {
     }
   };
 
+  // Issue #668: the confirmation names the sponsored account and the entry,
+  // and only then does Freighter open. Cancelling signs nothing.
+  const handleReviewEndSponsorship = (event) => {
+    event.preventDefault();
+    const row = { entryType: "trustline", ...endSponsorForm };
+    const confirmation = describeEndSponsorship(row);
+    setEndSponsorResult(null);
+    if (!confirmation) {
+      setEndSponsorConfirmation(null);
+      return showToast(
+        "This sponsorship entry cannot be identified, so it cannot be ended.",
+        "error"
+      );
+    }
+    setEndSponsorConfirmation({ ...confirmation, row });
+  };
+
+  const handleEndSponsorship = async () => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    if (!endSponsorConfirmation) return;
+
+    setLoading("end-sponsorship");
+    try {
+      const result = await endSponsorshipWithFreighter(
+        publicKey,
+        endSponsorConfirmation.row
+      );
+      setEndSponsorResult(result);
+      setEndSponsorConfirmation(null);
+      setEndSponsorForm({
+        sponsoredAccount: "",
+        assetCode: "",
+        assetIssuer: "",
+      });
+      showToast(`Sponsorship ended · ${result.hash.slice(0, 12)}…`, "success");
+    } catch (err) {
+      trackFailedSubmit("endSponsorship", err);
+      showToast(err.message || "Ending the sponsorship failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
   // Issue #541: stopping the watch aborts only the polling loop.
   const stopOfferWatch = useCallback(() => {
     offerWatchRef.current?.controller.abort();
@@ -2493,7 +2300,7 @@ export default function App() {
     setOfferWatchError(null);
     stopOfferWatch();
 
-    const offerId = offerForm.trim();
+    const offerId = offerWatchId.trim();
     const controller = new AbortController();
     const token = offerWatchTokenRef.current + 1;
     offerWatchTokenRef.current = token;
@@ -2602,106 +2409,9 @@ export default function App() {
     }
   };
 
-  const handleComposeAdd = (event) => {
-    event.preventDefault();
-    if (composeOps.length >= MAX_COMPOSED_OPERATIONS) {
-      return showToast(
-        `A transaction can contain at most ${MAX_COMPOSED_OPERATIONS} operations.`,
-        "error"
-      );
-    }
 
-    const entry = { type: composeForm.type };
-    if (composeForm.type === "payment") {
-      const selected = balances.find((b) => b.key === composeForm.assetKey);
-      entry.destination = composeForm.destination.trim();
-      entry.amount = composeForm.amount;
-      entry.asset =
-        selected && !selected.isNative
-          ? { isNative: false, code: selected.code, issuer: selected.issuer }
-          : { isNative: true };
-    } else if (composeForm.type === "changeTrust") {
-      entry.code = composeForm.code.trim();
-      entry.issuer = composeForm.issuer.trim();
-      entry.limit = composeForm.limit;
-    } else {
-      entry.name = composeForm.name.trim();
-      entry.value = composeForm.value;
-    }
 
-    try {
-      buildComposedOperation(entry);
-    } catch (err) {
-      return showToast(err.message, "error");
-    }
 
-    composeId.current += 1;
-    setComposeOps((previous) => [...previous, { ...entry, id: composeId.current }]);
-    setComposeForm((previous) => ({
-      ...previous,
-      destination: "",
-      amount: "",
-      code: "",
-      issuer: "",
-      limit: "1000000",
-      name: "",
-      value: "",
-    }));
-    setComposeResult(null);
-    setComposeError(null);
-  };
-
-  const moveComposeOperation = (index, offset) => {
-    setComposeOps((previous) => {
-      const target = index + offset;
-      if (target < 0 || target >= previous.length) return previous;
-      const next = [...previous];
-      [next[index], next[target]] = [next[target], next[index]];
-      return next;
-    });
-    setComposeResult(null);
-    setComposeError(null);
-  };
-
-  const removeComposeOperation = (index) => {
-    setComposeOps((previous) => previous.filter((_, i) => i !== index));
-    setComposeResult(null);
-    setComposeError(null);
-  };
-
-  const handleComposeSubmit = async () => {
-    if (composeOps.length === 0) {
-      setComposeError("Add at least one operation before signing.");
-      return;
-    }
-    if (!publicKey) {
-      return showToast("Connect Freighter first.", "error");
-    }
-
-    setLoading("compose");
-    setComposeError(null);
-    setComposeResult(null);
-    try {
-      const result = await submitComposedOperations(publicKey, composeOps);
-      setComposeResult({
-        hash: result.hash,
-        explorerUrl: explorerTxUrl(result.hash),
-      });
-      setComposeOps([]);
-      showToast(`Composed transaction submitted · ${result.hash.slice(0, 12)}…`);
-      try {
-        const next = await getAccountBalances(publicKey);
-        setBalances(next);
-      } catch {
-        /* balance refresh is best-effort */
-      }
-    } catch (err) {
-      setComposeError(err.message || "Composed transaction failed.");
-      showToast(err.message || "Composed transaction failed.", "error");
-    } finally {
-      setLoading("");
-    }
-  };
 
   const loadFeeStats = async () => {
     setLoading("feestats");
@@ -2738,6 +2448,21 @@ export default function App() {
       showToast(`Fee set to ${saved.stroops} stroops per operation.`);
     } catch (err) {
       showToast(err.message || "Could not save the fee.", "error");
+    }
+  };
+
+  const refreshClawbackAssets = async () => {
+    if (!publicKey) {
+      setClawbackAssets([]);
+      return;
+    }
+    try {
+      const next = await getAccountBalances(publicKey);
+      setClawbackAssets(
+        next.filter((balance) => !balance.isNative && balance.issuer === publicKey)
+      );
+    } catch {
+      setClawbackAssets([]);
     }
   };
 
@@ -2833,18 +2558,6 @@ export default function App() {
     }
   };
 
-  const activateTab = (tab) => {
-    setActiveTab(tab);
-    if (tab === "History") handleHistory();
-    if (tab === "Lab") {
-      loadLabInfo();
-      refreshLabState();
-    }
-    if ((tab === "Wallet" || tab === "Assets" || tab === "Send") && publicKey) {
-      refreshBalances();
-    }
-  };
-
   const handleTabKeyDown = (event, index) => {
     let nextIndex;
 
@@ -2885,7 +2598,472 @@ export default function App() {
     };
   }, [sendForm.destination]);
 
-  return (
+  
+  // --- grafted declarations ---
+  const [selectedTxHash, setSelectedTxHash] = useState(null);
+
+  const [signers, setSigners] = useState([]);
+
+  const [signerWeights, setSignerWeights] = useState([]);
+
+  const [highThreshold, setHighThreshold] = useState(0);
+
+  const [lowThreshold, setLowThreshold] = useState(0);
+
+  const [medThreshold, setMedThreshold] = useState(0);
+
+
+  const [createAccountResult, setCreateAccountResult] = useState(null);
+
+
+
+  const [, setResolvedFederation] = useState(null);
+
+  const [rpcHealth, setRpcHealth] = useState({
+    ok: null,
+    description: "checking",
+    latestLedger: null,
+    error: null,
+  });
+
+  const [sep7Uri, setSep7Uri] = useState("");
+
+  const [sep7Request, setSep7Request] = useState(null);
+
+  const [feeStatsError, setFeeStatsError] = useState(null);
+
+  const [feeStats, setFeeStats] = useState(null);
+
+  const [feeSetting, setFeeSetting] = useState(() => loadFeeSetting());
+
+  const [customFee, setCustomFee] = useState(() => {
+    const saved = loadFeeSetting();
+    return saved?.source === "custom" ? saved.stroops : "";
+  });
+
+
+
+
+
+
+  const [muxedError, setMuxedError] = useState(null);
+
+  const [muxedBuildForm, setMuxedBuildForm] = useState({ gAddress: "", id: "" });
+
+  const [muxedBuildResult, setMuxedBuildResult] = useState(null);
+
+  const [muxedSplitForm, setMuxedSplitForm] = useState({ mAddress: "" });
+
+  const [muxedSplitResult, setMuxedSplitResult] = useState(null);
+
+  const [horizonNotice, setHorizonNotice] = useState(null);
+
+  const [, setSelectedSigners] = useState([]);
+
+  const [codeTtl, setCodeTtl] = useState(null);
+
+  const [codeTtlError, setCodeTtlError] = useState(null);
+
+  const [bookPair, ] = useState(readStoredOrderBookPair);
+
+  const [, setBookResult] = useState(null);
+
+  const bookClearGenerationRef = useRef(0);
+
+  const [, setOfferLoading] = useState(false);
+
+  const [, setOfferError] = useState(null);
+
+  const [, setOpenOffers] = useState([]);
+
+
+  const [, setOfferPrices] = useState({});
+
+  const [, setOfferResult] = useState(null);
+
+  const [limitChangeForm, setLimitChangeForm] = useState({});
+
+
+
+  const [envelopeXdr, setEnvelopeXdr] = useState("");
+
+  const [decodeError, setDecodeError] = useState(null);
+
+  const [decodedEnvelope, setDecodedEnvelope] = useState(null);
+
+  const submitGuardRef = useRef(createSubmitGuard());
+
+  const startTxWatch = useCallback(
+    (hash) => {
+      const token = watchTokenRef.current + 1;
+      watchTokenRef.current = token;
+      setTxWatchError(null);
+      setTxWatch({
+        hash,
+        attempts: 0,
+        ...txStatusPresentation({
+          status: "pending",
+          explorerUrl: buildTransactionExplorerUrl(networkId, hash),
+        }),
+      });
+
+      watchTransactionStatus({
+        hash,
+        networkId,
+        onUpdate: (snapshot) => {
+          if (watchTokenRef.current !== token) return;
+          setTxWatch({ ...snapshot, ...txStatusPresentation(snapshot) });
+        },
+      }).catch((err) => {
+        if (watchTokenRef.current !== token) return;
+        setTxWatch(null);
+        setTxWatchError(err.message || "The transaction watch could not read this hash.");
+      });
+    },
+    [networkId]
+  );
+
+  
+  const readLabState = useCallback(
+    async (contractId) => {
+      if (!contractId) {
+        setLabState(null);
+        setLabStateError(null);
+        return;
+      }
+      setLoading("labstate");
+      setLabStateError(null);
+      try {
+        const state = await readKitewellState(contractId, publicKey);
+        setLabState(state);
+      } catch (e) {
+        setLabState(null);
+        setLabStateError(
+          e.message || "Could not read the kitewell contract via Soroban RPC."
+        );
+      } finally {
+        setLoading("");
+      }
+    },
+    [publicKey]
+  );
+
+  const actualSubentryCount = accountDetails?.subentryCount;
+
+  const trustlineAlreadyExists = balances.some(
+    (balance) =>
+      !balance.isNative &&
+      balance.code === trustForm.code.trim().toUpperCase() &&
+      balance.issuer === trustForm.issuer.trim()
+  );
+
+  const trustlineMinimum =
+    baseReserveInStroops != null && Number.isInteger(actualSubentryCount)
+      ? minimumBalanceInStroops(
+          baseReserveInStroops,
+          actualSubentryCount + (trustlineAlreadyExists ? 0 : 1)
+        )
+      : null;
+
+  let trustlineCheckError = null;
+
+  let trustlineAffordable = false;
+
+  const sellableAssets = assetBalances.filter(
+    (asset) => Number.parseFloat(asset.available ?? asset.balance) > 0
+  );
+
+  const refreshIssuerPanel = async () => {
+    if (!publicKey) return;
+    setLoading("issuer");
+    try {
+      const config = await getAccountAuthConfig(publicKey);
+      setIssuerConfig(config);
+      setIssuerConfigError(null);
+      setIssuerForm({
+        homeDomain: config.homeDomain || "",
+        authRequired: config.authRequired,
+        authRevocable: config.authRevocable,
+        authImmutable: config.authImmutable,
+        confirmation: "",
+      });
+    } catch (err) {
+      setIssuerConfig(null);
+      setIssuerConfigError(err.message || "Could not read account flags.");
+    }
+
+    try {
+      setIssuedTrustlines(await getIssuedAssetTrustlines(publicKey));
+      setIssuedTrustlinesError(null);
+    } catch (err) {
+      setIssuedTrustlines([]);
+      setIssuedTrustlinesError(err.message || "Could not read issued trustlines.");
+    }
+    setLoading("");
+  };
+
+  const handleSetIssuerOptions = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading("issuer-update");
+    try {
+      await setAccountOptionsWithFreighter(publicKey, {
+        current: issuerConfig || {},
+        homeDomain: issuerForm.homeDomain,
+        authRequired: issuerForm.authRequired,
+        authRevocable: issuerForm.authRevocable,
+        authImmutable: issuerForm.authImmutable,
+        immutableConfirmation: issuerForm.confirmation,
+      });
+      showToast("Account flags updated.");
+      // A successful update refreshes both the flags and the account balances.
+      await refreshIssuerPanel();
+      await refreshBalances();
+    } catch (err) {
+      showToast(err.message || "Could not update account flags.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleAllowTrust = async (entry, authorize) => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    setLoading(`allow-${entry.key}`);
+    try {
+      await allowTrustWithFreighter(publicKey, {
+        holder: entry.holder,
+        assetCode: entry.assetCode,
+        assetIssuer: entry.assetIssuer,
+        authorize,
+      });
+      showToast(
+        `${authorize ? "Authorized" : "Revoked"} ${shortenAddress(entry.holder)} for ${entry.assetCode}.`
+      );
+      await refreshIssuerPanel();
+    } catch (err) {
+      showToast(err.message || "Could not update the trustline.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const selectedSendAssetAvailable = selectedSendAsset
+    ? parseFloat(selectedSendAsset.balance) -
+      parseFloat(selectedSendAsset.sellingLiabilities || "0")
+    : null;
+
+  const txWatchPanel = (
+    <div className="section">
+      <h2>Transaction status</h2>
+      <p className="muted">
+        A transaction submitted here is followed until it reaches the ledger, fails, or passes
+        its max time.
+      </p>
+
+      {txWatch && (
+        <div
+          className={
+            txWatch.status === "failed" || txWatch.status === "expired"
+              ? "info-box info-box--warning"
+              : "info-box"
+          }
+          role="status"
+          aria-live="polite"
+        >
+          <span className="eyebrow">
+            <code>{txWatch.hash}</code> · {txWatch.status}
+          </span>
+          <p className="muted">{txWatch.text}</p>
+          <a
+            className="text-link"
+            href={txWatch.explorerUrl}
+            target="_blank"
+            rel="noreferrer"
+            style={{ marginTop: 6, display: "inline-block" }}
+          >
+            Explorer ↗
+          </a>
+        </div>
+      )}
+      {txWatchError && (
+        <div className="info-box info-box--warning">
+          <span className="eyebrow">Transaction watch</span>
+          <p className="muted">{txWatchError}</p>
+        </div>
+      )}
+
+      <form className="form" onSubmit={handleWatchHash}>
+        <label className="label" htmlFor="watch-tx-hash">
+          Watch a transaction hash
+        </label>
+        <input
+          id="watch-tx-hash"
+          className="input"
+          type="text"
+          placeholder="64 hexadecimal characters"
+          maxLength={64}
+          value={hashForm}
+          onChange={(e) => setHashForm(e.target.value)}
+          aria-describedby="watch-tx-hash-help"
+          required
+        />
+        <p className="muted" id="watch-tx-hash-help" role={hashError ? "alert" : undefined}>
+          {hashError || "Paste any transaction hash from this network to follow it."}
+        </p>
+        <button
+          className="btn btn--primary"
+          type="submit"
+          disabled={loading === "issue"}
+        >
+          Watch status
+        </button>
+      </form>
+    </div>
+  );
+
+  const muxedSendBase = (() => {
+    const value = sendForm.destination.trim();
+    if (!value) return null;
+    try {
+      return splitMuxedAddress(value).gAddress;
+    } catch {
+      return null;
+    }
+  })();
+
+  const handleBuildMuxed = (event) => {
+    event.preventDefault();
+    setMuxedError(null);
+    setMuxedBuildResult(null);
+    try {
+      setMuxedBuildResult(
+        buildMuxedAddress(
+          muxedBuildForm.gAddress.trim(),
+          muxedBuildForm.id.trim()
+        )
+      );
+    } catch (err) {
+      setMuxedError(err.message || "Could not build the muxed address.");
+    }
+  };
+
+  const handleSplitMuxed = (event) => {
+    event.preventDefault();
+    setMuxedError(null);
+    setMuxedSplitResult(null);
+    try {
+      const { gAddress, id } = splitMuxedAddress(
+        muxedSplitForm.mAddress.trim()
+      );
+      setMuxedSplitResult({ gAddress, id: id.toString() });
+    } catch (err) {
+      setMuxedError(err.message || "Could not split the muxed address.");
+    }
+  };
+
+  const handleDecodeEnvelope = (event) => {
+    event.preventDefault();
+    setDecodeError(null);
+    setDecodedEnvelope(null);
+    try {
+      setDecodedEnvelope(decodeEnvelope(envelopeXdr, activeNetwork.passphrase));
+    } catch (error) {
+      setDecodedEnvelope(null);
+      setDecodeError(error.message || "Could not decode the envelope.");
+    }
+  };
+
+  const activeContractId = sessionContractId || configuredContractId;
+
+  const trackSubmission = (hash, operationType) => {
+    txLogRef.current.record({
+      hash,
+      operationType,
+      network: getActiveNetworkId(),
+    });
+    setSessionTxs(txLogRef.current.list());
+  };
+
+  const confirmDuplicate = (message) => {
+    if (typeof window === "undefined" || typeof window.confirm !== "function") {
+      return false;
+    }
+    return window.confirm(message);
+  };
+  // --- end grafted declarations ---
+
+  // --- grafted declarations ---
+  const [signerInput, setSignerInput] = useState("");
+
+  const handleProposeAdmin = async (e) => {
+    e.preventDefault();
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    const contractId = labInfo?.network?.contract?.kitewell;
+    if (!contractId) {
+      return showToast(
+        "No contract id configured — deploy first (contracts/README.md).",
+        "error"
+      );
+    }
+    if (!proposeAdminForm.address.trim()) {
+      return showToast("Enter a successor admin address.", "error");
+    }
+    setLoading("propose-admin");
+    try {
+      const result = await proposeAdminWithFreighter(
+        publicKey,
+        contractId,
+        proposeAdminForm.address.trim()
+      );
+      setProposeAdminForm({ address: "" });
+      showToast(
+        result.confirmed
+          ? `Admin proposed · ${result.hash.slice(0, 12)}…`
+          : `Submitted · ${result.hash.slice(0, 12)}…`,
+        "success",
+        explorerTxUrl(result.hash)
+      );
+      await refreshLabState();
+    } catch (err) {
+      showToast(err.message || "Propose admin failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const handleAcceptAdmin = async () => {
+    if (!publicKey) return showToast("Connect Freighter first.", "error");
+    const contractId = labInfo?.network?.contract?.kitewell;
+    if (!contractId) {
+      return showToast(
+        "No contract id configured — deploy first (contracts/README.md).",
+        "error"
+      );
+    }
+    setLoading("accept-admin");
+    try {
+      const result = await acceptAdminWithFreighter(publicKey, contractId);
+      showToast(
+        result.confirmed
+          ? `Admin accepted · ${result.hash.slice(0, 12)}…`
+          : `Submitted · ${result.hash.slice(0, 12)}…`,
+        "success",
+        explorerTxUrl(result.hash)
+      );
+      await refreshLabState();
+    } catch (err) {
+      showToast(err.message || "Accept admin failed.", "error");
+    } finally {
+      setLoading("");
+    }
+  };
+
+  const txLogRef = useRef(createTxLog());
+
+  const [, setSessionTxs] = useState([]);
+
+  // --- end grafted declarations ---
+return (
     <div className="app">
       <div className="aurora" aria-hidden="true" />
 
@@ -3054,6 +3232,18 @@ export default function App() {
                   Explorer ↗
                 </a>
               </div>
+              {qrCodeDataUrl && (
+                <div className="qr-code-panel">
+                  <img
+                    className="qr-code-panel__image"
+                    src={qrCodeDataUrl}
+                    alt="QR code for the connected public address"
+                  />
+                  <p className="muted qr-code-panel__hint">
+                    Scan to copy the connected public address.
+                  </p>
+                </div>
+              )}
               {balances.filter((b) => !b.isNative).length > 0 && (
                 <div className="asset-chips">
                   {balances
@@ -3550,7 +3740,7 @@ export default function App() {
                           <button
                             className="btn btn--secondary btn--sm"
                             type="button"
-                            onClick={() => handleClawback(balance)}
+                            onClick={() => handleClawbackClaimable(balance)}
                             disabled={loading === `clawback-${balance.id}`}
                           >
                             {loading === `clawback-${balance.id}` ? "Clawing back…" : "Claw back"}
@@ -4868,8 +5058,8 @@ export default function App() {
                   inputMode="numeric"
                   pattern="[0-9]+"
                   placeholder="e.g. 123456789"
-                  value={offerForm}
-                  onChange={(e) => setOfferForm(e.target.value)}
+                  value={offerWatchId}
+                  onChange={(e) => setOfferWatchId(e.target.value)}
                   required
                 />
                 <p className="muted">
@@ -5170,6 +5360,14 @@ export default function App() {
                       )}
                     </button>
                   </div>
+                  <p className="muted" role="status">
+                    Contract instance: {contractStatusLabel(contractStatus)}
+                  </p>
+                  {contractCallBlock && (
+                    <div className="info-box info-box--warning">
+                      <p className="muted">{contractCallBlock}</p>
+                    </div>
+                  )}
                   {labState ? (
                     <div className="info-box">
                       <span className="eyebrow">Contract state</span>
@@ -5207,75 +5405,16 @@ export default function App() {
                       Reads lab_name, builder_count, and get_builder via Soroban RPC.
                     </p>
                   )}
-                  {adminState && (
-                    <div className="info-box">
-                      <span className="eyebrow">Admin</span>
-                      <div style={{ marginBottom: 12 }}>
-                        <span className="metadata-label">Current admin</span>
-                        <code style={{ display: "block", marginTop: 4 }}>
-                          {adminState.admin ? shortenAddress(adminState.admin) : "Not initialized"}
-                        </code>
-                      </div>
-                      {adminState.pendingAdmin && (
-                        <div style={{ marginBottom: 12 }}>
-                          <span className="metadata-label">Pending admin</span>
-                          <code style={{ display: "block", marginTop: 4 }}>
-                            {shortenAddress(adminState.pendingAdmin)}
-                          </code>
-                        </div>
-                      )}
-                      {publicKey === adminState.admin && (
-                        <form onSubmit={handleProposeAdmin} style={{ marginTop: 12 }}>
-                          <label className="label" htmlFor="propose-admin-address">
-                            Propose successor admin
-                          </label>
-                          <input
-                            id="propose-admin-address"
-                            className="input"
-                            placeholder="G… address"
-                            value={proposeAdminForm.address}
-                            onChange={(e) =>
-                              setProposeAdminForm({ address: e.target.value })
-                            }
-                          />
-                          <button
-                            className="btn btn--primary"
-                            type="submit"
-                            disabled={loading === "propose-admin"}
-                          >
-                            {loading === "propose-admin" ? (
-                              <>
-                                <Spinner /> Proposing…
-                              </>
-                            ) : (
-                              "Propose admin"
-                            )}
-                          </button>
-                        </form>
-                      )}
-                      {publicKey === adminState.pendingAdmin && (
-                        <div style={{ marginTop: 12 }}>
-                          <p className="muted" style={{ marginBottom: 8 }}>
-                            You are the pending admin. Accept to become the live admin.
-                          </p>
-                          <button
-                            className="btn btn--primary"
-                            type="button"
-                            onClick={handleAcceptAdmin}
-                            disabled={loading === "accept-admin"}
-                          >
-                            {loading === "accept-admin" ? (
-                              <>
-                                <Spinner /> Accepting…
-                              </>
-                            ) : (
-                              "Accept admin"
-                            )}
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  )}
+                  <LabAdminPanel
+                    adminState={adminState}
+                    publicKey={publicKey}
+                    proposeAdminForm={proposeAdminForm}
+                    setProposeAdminForm={setProposeAdminForm}
+                    onProposeAdmin={handleProposeAdmin}
+                    onAcceptAdmin={handleAcceptAdmin}
+                    loading={loading}
+                    Spinner={Spinner}
+                  />
                   {labStateError && (
                     <div className="info-box info-box--warning">
                       <span className="eyebrow">Contract state</span>
@@ -5288,7 +5427,7 @@ export default function App() {
                     <button
                       className="btn btn--secondary"
                       type="button"
-                      onClick={() => loadBuilderPage(builderList?.start ?? 0)}
+                      onClick={() => loadBuilderPage(0)}
                       disabled={!configuredContractId || loading === "builders"}
                     >
                       {loading === "builders" ? (
@@ -5299,7 +5438,26 @@ export default function App() {
                         "Refresh"
                       )}
                     </button>
+                    <button
+                      className="btn btn--secondary"
+                      type="button"
+                      disabled={!builderList}
+                      onClick={() =>
+                        downloadCsv(buildersToCsv(builderList?.rows), "builders.csv")
+                      }
+                      title="Download the builder page currently loaded"
+                    >
+                      Download CSV
+                    </button>
                   </div>
+                  {!builderList && (
+                    <p className="muted">Load the builder registry to export it.</p>
+                  )}
+                  {builderList && builderList.rows.length === 0 && (
+                    <p className="muted">
+                      No builders on this page — the export will contain only the header.
+                    </p>
+                  )}
                   {!configuredContractId && (
                     <p className="muted">
                       No contract id configured — no builders to list.
@@ -5312,6 +5470,22 @@ export default function App() {
                   )}
                   {builderList && configuredContractId && (
                     <>
+                      <p className="muted">
+                        Loaded {builderList.rows.length} / builder_count{" "}
+                        {labState?.builderCount ?? "unavailable"}
+                      </p>
+                      {isBuilderCountMismatch(
+                        builderList.rows.length,
+                        labState?.builderCount,
+                        builderList.nextStart
+                      ) && (
+                        <div className="info-box info-box--warning">
+                          <p className="muted">
+                            Count mismatch: loaded {builderList.rows.length} builders,
+                            but the contract reports {labState.builderCount}.
+                          </p>
+                        </div>
+                      )}
                       {builderList.rows.length > 0 ? (
                         <ul className="balance-list">
                           {builderList.rows.map((row) => (
@@ -5332,37 +5506,69 @@ export default function App() {
                             : "No builders registered yet."}
                         </p>
                       )}
-                      <div className="section__row">
-                        <button
-                          className="btn btn--secondary btn--sm"
-                          type="button"
-                          disabled={
-                            builderList.start === 0 || loading === "builders"
-                          }
-                          onClick={() =>
-                            loadBuilderPage(
-                              Math.max(0, builderList.start - builderList.limit)
-                            )
-                          }
-                        >
-                          Previous
-                        </button>
-                        <span className="muted">
-                          Showing from index {builderList.start}
-                        </span>
-                        <button
-                          className="btn btn--secondary btn--sm"
-                          type="button"
-                          disabled={
-                            builderList.nextStart === null ||
-                            loading === "builders"
-                          }
-                          onClick={() => loadBuilderPage(builderList.nextStart)}
-                        >
-                          Next
-                        </button>
-                      </div>
+                      {builderList.nextStart !== null && (
+                        <div className="section__row">
+                          <button
+                            className="btn btn--secondary btn--sm"
+                            type="button"
+                            disabled={loading === "builders"}
+                            onClick={() =>
+                              loadBuilderPage(
+                                builderList.nextStart,
+                                undefined,
+                                true
+                              )
+                            }
+                          >
+                            Load next page
+                          </button>
+                        </div>
+                      )}
                     </>
+                  )}
+
+                  <form className="form" onSubmit={handleBuilderLookup}>
+                    <div className="subhead">Builder lookup</div>
+                    <label className="label" htmlFor="builder-lookup-address">
+                      Stellar address
+                    </label>
+                    <input
+                      id="builder-lookup-address"
+                      className="input"
+                      type="text"
+                      maxLength={56}
+                      placeholder="G…"
+                      value={builderAddress}
+                      onChange={(e) => setBuilderAddress(e.target.value)}
+                    />
+                    <button
+                      className="btn btn--secondary"
+                      type="submit"
+                      disabled={loading === "builder-lookup"}
+                    >
+                      {loading === "builder-lookup" ? (
+                        <>
+                          <Spinner /> Looking up…
+                        </>
+                      ) : (
+                        "Look up builder"
+                      )}
+                    </button>
+                  </form>
+                  {builderLookupError && (
+                    <div className="info-box info-box--warning">
+                      <p className="muted">{builderLookupError}</p>
+                    </div>
+                  )}
+                  {builderLookupResult && (
+                    <div className="info-box">
+                      <span className="eyebrow">Builder</span>
+                      {builderLookupResult.registered ? (
+                        <code>{builderLookupResult.name}</code>
+                      ) : (
+                        <span className="muted">Not registered</span>
+                      )}
+                    </div>
                   )}
 
                   <form className="form" onSubmit={handleRegister}>
@@ -5388,7 +5594,8 @@ export default function App() {
                         loading === "register" ||
                         loading === "simulate" ||
                         requireWallet ||
-                        !registerSimulationReady
+                        !registerSimulationReady ||
+                        !canCallContract(contractStatus)
                       }
                     >
                       {loading === "register" ? (
@@ -5406,7 +5613,8 @@ export default function App() {
                       disabled={
                         loading === "simulate" ||
                         loading === "register" ||
-                        requireWallet
+                        requireWallet ||
+                        !canCallContract(contractStatus)
                       }
                     >
                       {loading === "simulate" ? (
@@ -5619,6 +5827,144 @@ export default function App() {
                       <code>{sponsorResult.hash}</code>
                       <a
                         href={explorerTxUrl(sponsorResult.hash)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-link"
+                      >
+                        Explorer ↗
+                      </a>
+                    </div>
+                  )}
+
+                  <div className="subhead">End a sponsorship</div>
+                  <p className="muted">
+                    Ends one entry from the sponsorship list with a single
+                    revoke-sponsorship operation. Nothing is signed until the
+                    confirmation below is accepted.
+                  </p>
+                  <form className="form" onSubmit={handleReviewEndSponsorship}>
+                    <label className="label" htmlFor="end-sponsor-account">
+                      Sponsored account
+                    </label>
+                    <input
+                      id="end-sponsor-account"
+                      className="input"
+                      type="text"
+                      placeholder="G…"
+                      value={endSponsorForm.sponsoredAccount}
+                      onChange={(e) => {
+                        setEndSponsorForm({
+                          ...endSponsorForm,
+                          sponsoredAccount: e.target.value,
+                        });
+                        setEndSponsorConfirmation(null);
+                      }}
+                    />
+                    <label className="label" htmlFor="end-sponsor-code">
+                      Asset code
+                    </label>
+                    <input
+                      id="end-sponsor-code"
+                      className="input"
+                      type="text"
+                      placeholder="USDC"
+                      maxLength={12}
+                      value={endSponsorForm.assetCode}
+                      onChange={(e) => {
+                        setEndSponsorForm({
+                          ...endSponsorForm,
+                          assetCode: e.target.value,
+                        });
+                        setEndSponsorConfirmation(null);
+                      }}
+                    />
+                    <label className="label" htmlFor="end-sponsor-issuer">
+                      Asset issuer
+                    </label>
+                    <input
+                      id="end-sponsor-issuer"
+                      className="input"
+                      type="text"
+                      placeholder="G…"
+                      value={endSponsorForm.assetIssuer}
+                      onChange={(e) => {
+                        setEndSponsorForm({
+                          ...endSponsorForm,
+                          assetIssuer: e.target.value,
+                        });
+                        setEndSponsorConfirmation(null);
+                      }}
+                    />
+                    <button
+                      className="btn btn--secondary"
+                      type="submit"
+                      disabled={
+                        loading === "end-sponsorship" ||
+                        requireWallet ||
+                        !hasEndSponsorshipAction({
+                          entryType: "trustline",
+                          ...endSponsorForm,
+                        })
+                      }
+                    >
+                      Review
+                    </button>
+                  </form>
+                  {endSponsorConfirmation && (
+                    <div className="info-box info-box--warning">
+                      <span className="eyebrow">Confirm end sponsorship</span>
+                      <p className="muted">{endSponsorConfirmation.message}</p>
+                      <div className="metadata-grid">
+                        <div>
+                          <span className="metadata-label">
+                            Sponsored account
+                          </span>
+                          <span className="metadata-value">
+                            {endSponsorConfirmation.sponsoredAccount}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="metadata-label">Entry</span>
+                          <span className="metadata-value">
+                            {endSponsorConfirmation.entryLabel}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="section__row">
+                        <button
+                          className="btn btn--secondary"
+                          type="button"
+                          onClick={() => setEndSponsorConfirmation(null)}
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          className="btn btn--primary"
+                          type="button"
+                          onClick={handleEndSponsorship}
+                          disabled={loading === "end-sponsorship"}
+                        >
+                          {loading === "end-sponsorship" ? (
+                            <>
+                              <Spinner /> Signing in Freighter…
+                            </>
+                          ) : (
+                            "Sign & end sponsorship"
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  {endSponsorResult && (
+                    <div className="info-box">
+                      <span className="eyebrow">Sponsorship ended</span>
+                      <p className="muted">
+                        {endSponsorResult.entryLabel} held by{" "}
+                        {endSponsorResult.sponsoredAccount}
+                      </p>
+                      <code>{endSponsorResult.hash}</code>
+                      <a
+                        href={explorerTxUrl(endSponsorResult.hash)}
                         target="_blank"
                         rel="noreferrer"
                         className="text-link"
@@ -6006,7 +6352,8 @@ export default function App() {
                         <input
                           type="text"
                           placeholder="Signer public key (G...)"
-                          onChange={(e) => handleAddSigner(e.target.value)}
+                          value={signerInput}
+                          onChange={(e) => setSignerInput(e.target.value)}
                         />
                         <button
                           className="btn btn--primary"
@@ -6020,17 +6367,18 @@ export default function App() {
                     )}
                     <div className="section__row">
                       <button
-        type="submit"
-        disabled={loading === "setoptions" || requireWallet}
-      >
-        {loading === "setoptions" ? (
-          <>
-            <Spinner /> Signing in Freighter…
-          </>
-        ) : (
-          "Submit setOptions"
-        )}
-      </button>
+                        className="btn btn--primary"
+                        type="submit"
+                        disabled={loading === "setoptions" || requireWallet}
+                      >
+                        {loading === "setoptions" ? (
+                          <>
+                            <Spinner /> Signing in Freighter…
+                          </>
+                        ) : (
+                          "Submit setOptions"
+                        )}
+                      </button>
                     </div>
                   </form>
                 )}
@@ -6038,9 +6386,9 @@ export default function App() {
                   <div className="warning-box">
                     <span className="eyebrow">Warning</span>
                     <p className="muted">
-                      {mediumThreshold > (signers.reduce((sum, w) => sum + (w.weight ?? 0), 0) || 0)
-                        ? "Medium threshold exceeds total signer weights!"
-                        : ""}
+                      {medThreshold > (signers.reduce((sum, signer) => sum + (signerWeights[signers.indexOf(signer)] ?? 0), 0) || 0)
+                        ? "Medium threshold exceeds total signer weights."
+                        : "Thresholds are covered by the current signer weights."}
                     </p>
                   </div>
                 )}
@@ -6049,7 +6397,6 @@ export default function App() {
               {!labInfo && !labError && (
                 <p className="muted">Open this tab to probe the backend.</p>
               )}
-              <div className="info-box">
               <div className="info-box">
                 <span className="eyebrow">Failed submits</span>
                 <p className="muted">
@@ -6080,22 +6427,8 @@ export default function App() {
                   type="button"
                   onClick={handleHistory}
                   disabled={loading === "history" || requireWallet}
-
-                <span className="eyebrow">Failed submits</span>
-                <p className="muted">
-                  {failedSubmits.length === 0
-                    ? "No failed submits this session yet."
-                    : `${failedSubmits.length} failed submission${
-                        failedSubmits.length === 1 ? "" : "s"
-                      } this session. Cleared on disconnect or reload — not stored in localStorage.`}
-                </p>
-                <button
-                  className="btn btn--secondary"
-                  type="button"
-                  onClick={handleDownloadFailedSubmits}
-                  disabled={failedSubmits.length === 0}
                 >
-                  Download failed JSON
+                  {loading === "history" ? "Loading…" : "Refresh"}
                 </button>
               </div>
 
@@ -6378,6 +6711,7 @@ export default function App() {
                   {filteredTransactions.map((tx) => {
                     const isOutgoing = tx.from === publicKey;
                     const createdAt = formatCreatedAt(tx.created_at);
+                    const memo = mapPaymentMemo(tx);
                     return (
                       <div
                         key={tx.id}
@@ -6414,43 +6748,21 @@ export default function App() {
                         <div className="tx-item__fee muted">
                           {formatHistoryFee(tx)}
                         </div>
+                        <div className="tx-item__memo">
+                          <span className="metadata-label">{memo.label}</span>
+                          <span className="tx-item__memo-value">{memo.value}</span>
+                        </div>
                         {createdAt && (
                           <time
                             className="tx-item__time"
                             dateTime={tx.created_at}
                           >
-                            <div className="tx-item__direction">
-                              {isOutgoing ? "Sent" : "Received"}
-                            </div>
-                            <div className="tx-item__amount">
-                              {parseFloat(tx.amount).toLocaleString()} {tx.asset_code || "XLM"}
-                            </div>
-                            <div className="tx-item__addr muted">
-                              {isOutgoing
-                                ? `To ${shortenAddress(tx.to)}`
-                                : `From ${shortenAddress(tx.from)}`}
-                            </div>
-                            <a
-                              href={explorerTxUrl(tx.transaction_hash)}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="tx-item__link"
-                            >
-                              Explorer ↗
-                            </a>
-                            {createdAt && (
-                              <time
-                                className="tx-item__time"
-                                dateTime={tx.created_at}
-                              >
-                                {createdAt}
-                              </time>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </section>
-                  ))}
+                            {createdAt}
+                          </time>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               ) : (
                 !loading && (
@@ -7099,23 +7411,6 @@ function streamStatusLabel(state) {
   return "Payments stream not running.";
 }
 
-function describeComposeOperation(operation) {
-  if (operation.type === "payment") {
-    const asset = operation.asset?.isNative
-      ? "XLM"
-      : `${operation.asset?.code}:${shortenAddress(operation.asset?.issuer)}`;
-    return `Payment · ${operation.amount} ${asset} to ${shortenAddress(
-      operation.destination
-    )}`;
-  }
-
-  if (operation.type === "changeTrust") {
-    return `Change trust · ${operation.code} · limit ${operation.limit}`;
-  }
-
-  const value = operation.value ? ` = ${operation.value}` : " (delete)";
-  return `Manage data · ${operation.name}${value}`;
-}
 
 function formatCreatedAt(value) {
   if (!value) return null;
