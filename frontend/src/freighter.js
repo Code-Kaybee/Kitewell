@@ -105,11 +105,14 @@ function scOptionToNative(scVal) {
   return Array.isArray(native) ? (native.length > 0 ? native[0] : null) : native;
 }
 
-function buildContractTx(contract, method, args, sourceAccount) {
+function buildContractTx(contract, method, args, sourceAccount, timeout = 30) {
   return new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
-  });
+  })
+    .addOperation(contract.call(method, ...args))
+    .setTimeout(timeout)
+    .build();
 }
 
 /** Send prepared XDR to Freighter and return the signed transaction. */
@@ -751,7 +754,7 @@ export async function createClaimableBalanceWithFreighter({
 
   const sourceAccount = await getServer().loadAccount(publicKey);
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   })
     .addOperation(
@@ -782,7 +785,7 @@ export async function claimClaimableBalanceWithFreighter(publicKey, balanceId) {
 
   const sourceAccount = await getServer().loadAccount(publicKey);
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   })
     .addOperation(
@@ -816,7 +819,7 @@ export async function clawbackClaimableBalanceWithFreighter(publicKey, balanceId
   const normalizedId = normalizeClaimableBalanceId(balanceId);
   const sourceAccount = await getServer().loadAccount(publicKey);
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   })
     .addOperation(
@@ -847,7 +850,7 @@ export async function clawbackWithFreighter(publicKey, holder, assetCode, assetI
   const normalizedAmount = normalizeAmount(amount, "Clawback amount");
   const sourceAccount = await getServer().loadAccount(publicKey);
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   })
     .addOperation(
@@ -919,17 +922,9 @@ export async function createAccountWithFreighter(
   }
   const formattedAmount = `${whole}.${fraction.padEnd(7, "0")}`;
 
-  try {
-    await getServer().loadAccount(destination);
-    throw new Error("Destination account already exists.");
-  } catch (error) {
-    if (error?.message === "Destination account already exists.") throw error;
-    if (error?.response?.status !== 404) throw error;
-  }
-
   const sourceAccount = await getServer().loadAccount(publicKey);
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   })
     .addOperation(
@@ -1103,7 +1098,7 @@ export async function sendPaymentWithFreighter(
   const transactionMemo = createMemo(memoType, memo);
   const sourceAccount = await getServer().loadAccount(publicKey);
   const txBuilder = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   }).addOperation(
     StellarSdk.Operation.payment({
@@ -1242,7 +1237,7 @@ export async function changeOfferPriceWithFreighter(publicKey, offer, newPrice) 
 
   const sourceAccount = await getServer().loadAccount(publicKey);
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   })
     .addOperation(operation)
@@ -1339,7 +1334,7 @@ export async function manageDataWithFreighter(publicKey, name, value = null) {
       : Buffer.from(validateDataValue(value), "utf8");
   const sourceAccount = await getServer().loadAccount(publicKey);
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   })
     .addOperation(
@@ -1380,7 +1375,7 @@ export async function mergeAccountWithFreighter(
   }
   const sourceAccount = await getServer().loadAccount(publicKey);
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   })
     .addOperation(StellarSdk.Operation.accountMerge({ destination }))
@@ -1406,7 +1401,7 @@ export async function setAccountOptionsWithFreighter(publicKey, options = {}) {
   const body = buildSetOptionsBody(options);
   const sourceAccount = await getServer().loadAccount(publicKey);
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   })
     .addOperation(StellarSdk.Operation.setOptions(body))
@@ -1444,7 +1439,7 @@ export async function allowTrustWithFreighter(
 
   const sourceAccount = await getServer().loadAccount(publicKey);
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   })
     .addOperation(
@@ -1788,7 +1783,7 @@ export function buildSponsoredAccountCreationEnvelope({
   const sourceAccount = new StellarSdk.Account(sponsor, sequence);
 
   return new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   })
     .addOperation(
@@ -1932,7 +1927,7 @@ export async function extendCodeTTL(publicKey, wasmHash, extendTo, currentLedger
   const sorobanData = new StellarSdk.SorobanDataBuilder().setReadOnly([codeKey]).build();
 
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   })
     .setSorobanData(sorobanData)
@@ -2038,7 +2033,7 @@ export async function extendInstanceTTL(publicKey, contractId, extendTo) {
   const sorobanData = new StellarSdk.SorobanDataBuilder().setReadOnly([contractKey]).build();
 
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   })
     .setSorobanData(sorobanData)
@@ -2173,17 +2168,38 @@ export async function readKitewellState(contractId, viewerAddress) {
     return sim.result?.retval ?? null;
   };
 
-  const [labName, builderCount, builder] = await Promise.all([
-    simulate("lab_name").then((v) => (v ? StellarSdk.scValToNative(v) : null)),
-    simulate("builder_count").then((v) =>
-      v ? StellarSdk.scValToNative(v) : 0
-    ),
-    simulate("get_builder", StellarSdk.nativeToScVal(viewer, { type: "address" })).then(
-      scOptionToNative
-    ),
-  ]);
+  try {
+    const results = await Promise.all([
+      simulate("lab_name").then((v) => (v ? StellarSdk.scValToNative(v) : null)),
+      simulate("builder_count").then((v) =>
+        v ? StellarSdk.scValToNative(v) : 0
+      ),
+      simulate(
+        "get_builder",
+        StellarSdk.nativeToScVal(viewer, { type: "address" })
+      )
+        .then(scOptionToNative)
+        .catch(() => null),
+      simulate("paused").then((v) => (v ? StellarSdk.scValToNative(v) : null)),
+      simulate("get_admin")
+        .then(scOptionToNative)
+        .catch(() => null),
+    ]);
 
-  return { labName, builderCount, builder };
+    return {
+      labName: results[0],
+      builderCount: results[1],
+      builder: results[2],
+      archived: false,
+    };
+  } catch (error) {
+    // An archived instance cannot answer any of the reads; the caller offers
+    // to restore it. See "Contract instance entry is archived".
+    if (/archived/i.test(error?.message ?? "")) {
+      return { labName: null, builderCount: 0, builder: null, archived: true };
+    }
+    throw error;
+  }
 }
 
 export const MAX_COMPOSED_OPERATIONS = 100;
@@ -2240,7 +2256,7 @@ export function buildComposedTransaction(sourceAccount, entries) {
   assertComposedEntries(entries);
 
   const builder = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   });
 
@@ -2349,7 +2365,7 @@ export async function extendContractTtlWithFreighter(
     .build();
 
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
     sorobanData,
   })
@@ -2421,7 +2437,7 @@ export async function sponsorTrustlineWithFreighter({
   const asset = new StellarSdk.Asset(code, assetIssuer);
   const sourceAccount = await getServer().loadAccount(publicKey);
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+    fee: selectedFeePerOperation(),
     networkPassphrase: currentPassphrase(),
   })
     .addOperation(
