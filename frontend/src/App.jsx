@@ -94,6 +94,7 @@ import {
   endSponsorshipWithFreighter,
   hasEndSponsorshipAction,
 } from "./sponsorshipRevoke";
+import { readContractInstanceTtl } from "./contractInstanceTtl";
 import { decodeEnvelope, formatArgumentValue } from "./envelopeDecoder";
 import { formatSimulationFee } from "./simulationFees";
 import { mapPaymentMemo } from "./paymentMemo";
