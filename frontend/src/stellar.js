@@ -8,7 +8,8 @@ import {
   isFriendbotAvailable,
   NETWORKS,
 } from "./network";
-import { calculateMinimumBalance } from "./accountReserve";
+import { paymentMemoFields } from "./paymentMemo";
+import { mapTransactionFee } from "./historyFee";
 
 /** Shown in the lab panel when Horizon asks the client to slow down. */
 export const HORIZON_SLOWDOWN_MESSAGE =
@@ -23,6 +24,77 @@ const HORIZON_429_MAX_WAIT_SEC = 30;
  * @type {Map<string, { streak: number }>}
  */
 const horizon429BackoffByNetwork = new Map();
+
+function horizonStatus(error) {
+  return error?.response?.status ?? error?.status ?? null;
+}
+
+export function isHorizonSlowdownError(error) {
+  return horizonStatus(error) === 429;
+}
+
+function horizonRetryAfterSeconds(error, streak) {
+  const headers = error?.response?.headers;
+  const header = typeof headers?.get === "function"
+    ? headers.get("retry-after")
+    : headers?.["retry-after"];
+  const parsed = Number(header);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return Math.min(parsed, HORIZON_429_MAX_WAIT_SEC);
+  }
+  return Math.min(
+    HORIZON_429_BASE_WAIT_SEC * 2 ** Math.max(streak, 0),
+    HORIZON_429_MAX_WAIT_SEC
+  );
+}
+
+async function withHorizon429Backoff(task) {
+  const networkId = getActiveNetworkId();
+  const state = horizon429BackoffByNetwork.get(networkId) || { streak: 0 };
+  let attempt = 0;
+  for (;;) {
+    try {
+      const result = await task();
+      horizon429BackoffByNetwork.set(networkId, { streak: 0 });
+      return result;
+    } catch (error) {
+      if (!isHorizonSlowdownError(error) || attempt >= 2) throw error;
+      const wait = horizonRetryAfterSeconds(error, state.streak);
+      state.streak += 1;
+      horizon429BackoffByNetwork.set(networkId, state);
+      await new Promise((resolve) => setTimeout(resolve, wait * 1000));
+      attempt += 1;
+    }
+  }
+}
+
+export function resetHorizon429BackoffForTests() {
+  horizon429BackoffByNetwork.clear();
+}
+
+function abortError() {
+  const error = new Error("The request was aborted.");
+  error.name = "AbortError";
+  return error;
+}
+
+function defaultSleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        reject(abortError());
+      },
+      { once: true }
+    );
+  });
+}
 
 function getServer() {
   return new StellarSdk.Horizon.Server(getActiveNetwork().horizonUrl);
@@ -250,7 +322,7 @@ export async function getAccountMergeBlockers(publicKey) {
   let account;
   if (backendIsUsable()) {
     try {
-      account = await fetchAccountViaApi(publicKey);
+      account = await fetchAccountViaApi(publicKey, getActiveNetworkId());
     } catch {
       account = await getServer().loadAccount(publicKey);
     }
@@ -596,15 +668,6 @@ export function calculateAvailableBalance(
   return Math.max(0, total - sellingLiabilities).toFixed(7);
 }
 
-function liabilityFields(balance, isNative, subentryCount, baseReserve) {
-  const sellingLiabilities = parseFloat(balance.selling_liabilities || "0");
-  const buyingLiabilities = parseFloat(balance.buying_liabilities || "0");
-  return {
-    sellingLiabilities: sellingLiabilities.toFixed(7),
-    buyingLiabilities: buyingLiabilities.toFixed(7),
-    available: calculateAvailableBalance(balance, isNative, subentryCount, baseReserve),
-  };
-}
 
 /**
  * Hide only idle, zero-balance credit trustlines. Native XLM, pool shares and
@@ -624,8 +687,9 @@ export function filterVisibleBalances(balances, hideZeroCreditAssets = false) {
   });
 }
 
+let baseReserve = 0.5;
+
 async function readBaseReserve() {
-  let baseReserve = 0.5;
   try {
     if (getServer().ledgers) {
       const ledgerInfo = await getServer().ledgers().order("desc").limit(1).call();
@@ -639,8 +703,7 @@ async function readBaseReserve() {
   return baseReserve;
 }
 
-function mapHorizonBalances(account, baseReserve = 0.5) {
-  const subentryCount = account.subentry_count || 0;
+function mapHorizonBalances(account) {
   return account.balances.map((b) => {
     const sellingLiabilities = b.selling_liabilities ?? "0";
     const buyingLiabilities = b.buying_liabilities ?? "0";
@@ -689,7 +752,7 @@ function mapClaimableBalance(record, publicKey) {
  * the filter server-side so another account's balance is never offered for
  * clawback.
  */
-export async function getClaimableBalances(publicKey) {
+export async function getSponsoredClaimableBalances(publicKey) {
   const records = await getServer()
     .claimableBalances()
     .forSponsor(publicKey)
@@ -724,7 +787,7 @@ export async function getClaimableBalances(publicKey) {
 export async function getAccountBalances(publicKey, options = {}) {
   if (backendIsUsable()) {
     try {
-      const data = await fetchAccountViaApi(publicKey);
+      const data = await fetchAccountViaApi(publicKey, getActiveNetworkId());
       return data.balances;
     } catch {
       /* fall back to direct Horizon */
@@ -740,7 +803,7 @@ export async function getAccountBalances(publicKey, options = {}) {
 export async function getAccountDetails(publicKey) {
   if (backendIsUsable()) {
     try {
-      return await fetchAccountViaApi(publicKey);
+      return await fetchAccountViaApi(publicKey, getActiveNetworkId());
     } catch {
       /* fall back to direct Horizon */
     }
@@ -753,7 +816,6 @@ export async function getAccountDetails(publicKey) {
     subentryCount: account.subentry_count,
     lastModifiedLedger: account.last_modified_ledger ?? null,
     thresholds: account.thresholds,
-    signers: account.signers,
     balances: mapHorizonBalances(account),
     dataEntries: mapAccountDataEntries(account),
     signers: account.signers || [],
@@ -977,9 +1039,12 @@ export function liquidityPoolWithdraw(poolId, amount, minAmountA, minAmountB) {
 export async function getTransactions(publicKey, limit = 15, cursor, options = {}) {
   if (backendIsUsable()) {
     try {
-      return options.signal
-        ? await fetchPaymentsViaApi(publicKey, limit, cursor, options)
-        : await fetchPaymentsViaApi(publicKey, limit, cursor);
+      return await fetchPaymentsViaApi(
+        publicKey,
+        limit,
+        cursor,
+        getActiveNetworkId()
+      );
     } catch {
       /* fall back to direct Horizon */
     }
@@ -991,6 +1056,8 @@ export async function getTransactions(publicKey, limit = 15, cursor, options = {
       .forAccount(publicKey)
       .limit(limit)
       .order("desc");
+    // Embeds each payment's transaction record; stubbed builders may omit it.
+    if (typeof request.join === "function") request = request.join("transactions");
     if (cursor) request = request.cursor(cursor);
     const payments = await request.call();
     const lastRaw = payments.records[payments.records.length - 1];
@@ -1008,6 +1075,7 @@ export async function getTransactions(publicKey, limit = 15, cursor, options = {
           transaction_hash: p.transaction_hash,
           created_at: p.created_at,
           ...mapTransactionFee(p.transaction),
+          ...paymentMemoFields(p.transaction),
         })),
       nextCursor:
         payments.records.length < limit ? null : (lastRaw?.paging_token ?? null),
@@ -1275,11 +1343,139 @@ export async function watchOfferUntilGone(offerId, options = {}) {
   return { status: "still-open", stillListed: null };
 }
 
-export async function getPendingTransactions(publicKey, options = {}) {
+export function selectPendingTransactions(records = []) {
+  return records
+    .filter((row) => String(row.status || row.tx_status || "").toLowerCase() === "pending")
+    .map((row) => ({
+      hash: row.hash,
+      fee: row.fee ?? row.max_fee ?? null,
+      sequence: row.sequence ?? null,
+      status: "pending",
+    }));
+}
+
+export async function getPendingTransactions(publicKey) {
   return withHorizon429Backoff(async () => {
     const url = `${getActiveNetwork().horizonUrl}/accounts/${encodeURIComponent(
       publicKey
     )}/pending_transactions`;
+    const response = await fetch(url);
+    if (response.status === 404) return [];
+    if (!response.ok) {
+      const error = new Error("Could not load pending transactions.");
+      error.status = response.status;
+      throw error;
+    }
+    const body = await response.json();
+    return selectPendingTransactions(body?._embedded?.records || []);
+  });
+}
+
+export async function getAccountTrades(publicKey, { limit = 10, cursor } = {}) {
+  if (!StellarSdk.StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error("Connect a valid Freighter address first.");
+  }
+
+  let builder = getServer().trades().forAccount(publicKey).limit(limit).order("desc");
+  if (cursor) builder = builder.cursor(cursor);
+  const response = await builder.call();
+  const records = response.records || [];
+
+  return {
+    records: records.map((trade) => ({
+      id: trade.id,
+      ledger_close_time: trade.ledger_close_time,
+      offer_id: trade.offer_id,
+      base_account: trade.base_account,
+      base_amount: trade.base_amount,
+      base_asset_type: trade.base_asset_type,
+      base_asset_code: trade.base_asset_code,
+      base_asset_issuer: trade.base_asset_issuer,
+      counter_account: trade.counter_account,
+      counter_amount: trade.counter_amount,
+      counter_asset_type: trade.counter_asset_type,
+      counter_asset_code: trade.counter_asset_code,
+      counter_asset_issuer: trade.counter_asset_issuer,
+      price: trade.price,
+      base_is_seller: trade.base_is_seller,
+    })),
+    nextCursor: records.length > 0
+      ? records[records.length - 1].paging_token
+      : null,
+  };
+}
+
+export { summarizeEnvelopeSignatures } from "./multisigEnvelope";
+
+// --- grafted module declarations ---
+function mapOrderBookRows(rows = []) {
+  return rows.slice(0, 10).map((row) => ({
+    amount: row.amount,
+    price: row.price,
+    priceR: row.price_r,
+  }));
+}
+
+// --- grafted module declarations ---
+function base64ToBytes(value) {
+  const binary = globalThis.atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function bytesToHex(bytes) {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function bytesEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+export function getTransactionDetails(input, options = {}) {
+  const hash = normaliseTxHash(input);
+  const base = getActiveNetwork().horizonUrl;
+  const key = `${base}|${hash}`;
+
+  const pending = transactionDetailRequests.get(key);
+  if (pending) return pending;
+
+  const read = async (path) => {
+    const response = await fetch(`${base}/transactions/${hash}${path}`);
+    if (response.status === 404) {
+      throw new Error("Transaction not found on this network.");
+    }
+    if (!response.ok) {
+      const error = new Error(`Could not load transaction (HTTP ${response.status}).`);
+      error.status = response.status;
+      throw error;
+    }
+    return response.json();
+  };
+
+  const request = withHorizon429Backoff(async () => {
+    const [transaction, operationPage, effectPage] = await Promise.all([
+      read(""),
+      read("/operations?limit=200&include_failed=true"),
+      read("/effects?limit=200"),
+    ]);
+    return {
+      transaction,
+      operations: operationPage?._embedded?.records || [],
+      effects: effectPage?._embedded?.records || [],
+    };
+  }, options).finally(() => transactionDetailRequests.delete(key));
+
+  transactionDetailRequests.set(key, request);
+  return request;
+}
+
+export async function getTrades(publicKey, limit = 15, cursor) {
+  if (!publicKey || typeof publicKey !== "string") {
+    throw new Error("Public key is required.");
+  }
 
   let builder = getServer()
     .trades()
@@ -1317,4 +1513,182 @@ export async function getPendingTransactions(publicKey, options = {}) {
   };
 }
 
-export { summarizeEnvelopeSignatures } from "./multisigEnvelope";
+export async function getAccountSnapshot(publicKey) {
+  if (!publicKey || typeof publicKey !== "string") {
+    throw new Error("Public key is required.");
+  }
+
+  const account = await getServer().loadAccount(publicKey);
+
+  // Fetch offers for this account
+  let offers;
+  try {
+    const offersResponse = await getServer()
+      .offers()
+      .forAccount(publicKey)
+      .limit(200)
+      .call();
+    offers = offersResponse.records.map((offer) => ({
+      id: offer.id,
+      selling: offer.selling,
+      buying: offer.buying,
+      amount: offer.amount,
+      price: offer.price,
+      price_r: offer.price_r,
+    }));
+  } catch {
+    // Offers are optional; if fetch fails, continue with empty array
+    offers = [];
+  }
+
+  // Process data entries, converting non-UTF-8 values to hex
+  const dataEntries = {};
+  if (account.data_attr) {
+    Object.entries(account.data_attr).forEach(([key, value]) => {
+      try {
+        // Try to decode as UTF-8
+        const bytes = base64ToBytes(value);
+        const decoded = new TextDecoder().decode(bytes);
+        // Check if it round-trips correctly (is valid UTF-8)
+        if (bytesEqual(bytes, new TextEncoder().encode(decoded))) {
+          dataEntries[key] = decoded;
+        } else {
+          // Not valid UTF-8, store as hex
+          dataEntries[key] = bytesToHex(bytes);
+        }
+      } catch {
+        // If decoding fails, store the raw base64 value
+        dataEntries[key] = value;
+      }
+    });
+  }
+
+  return {
+    id: account.id,
+    sequence: account.sequenceNumber(),
+    subentryCount: account.subentry_count,
+    thresholds: {
+      low: account.thresholds.low_threshold,
+      medium: account.thresholds.med_threshold,
+      high: account.thresholds.high_threshold,
+    },
+    signers: account.signers.map((signer) => ({
+      key: signer.key,
+      weight: signer.weight,
+      type: signer.type,
+    })),
+    balances: mapHorizonBalances(account),
+    data: dataEntries,
+    offers,
+    network: getActiveNetworkId(),
+    exportedAt: new Date().toISOString(),
+  };
+}
+
+export async function downloadAccountSnapshot(publicKey) {
+  const snapshot = await getAccountSnapshot(publicKey);
+
+  const filename = `kitewell-account-${snapshot.id.slice(0, 8)}-${Date.now()}.json`;
+  const json = JSON.stringify(snapshot, null, 2);
+  const blob = new Blob([json], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+
+  URL.revokeObjectURL(url);
+}
+
+export async function fetchStellarToml(domainOrIssuer) {
+  if (!domainOrIssuer || typeof domainOrIssuer !== "string") {
+    throw new Error("Domain or issuer address is required.");
+  }
+
+  const trimmed = domainOrIssuer.trim();
+  if (!trimmed) {
+    throw new Error("Domain or issuer address is required.");
+  }
+
+  return StellarSdk.StellarTomlResolver.resolve(trimmed, {
+    allowHttp: false,
+  });
+}
+
+export async function fetchTransferServerInfo(transferServerUrl) {
+  if (!transferServerUrl || typeof transferServerUrl !== "string") {
+    throw new Error("Transfer server URL is required.");
+  }
+
+  const trimmed = transferServerUrl.trim();
+  if (!trimmed) {
+    throw new Error("Transfer server URL is required.");
+  }
+
+  // Only allow HTTPS URLs for security
+  if (!trimmed.startsWith("https://")) {
+    throw new Error("Transfer server URL must use HTTPS.");
+  }
+
+  // Build info endpoint URL, ensuring no double slashes
+  const baseUrl = trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+  const infoUrl = `${baseUrl}/info`;
+
+  const response = await fetch(infoUrl);
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch transfer server info: ${response.status} ${response.statusText}`
+    );
+  }
+
+  return response.json();
+}
+
+export async function fetchAnchorInfo(domainOrIssuer) {
+  const toml = await fetchStellarToml(domainOrIssuer);
+
+  let transferServerInfo = null;
+  if (toml.TRANSFER_SERVER) {
+    try {
+      transferServerInfo = await fetchTransferServerInfo(toml.TRANSFER_SERVER);
+    } catch {
+      // If the info endpoint fails, we still return the toml data
+      transferServerInfo = null;
+    }
+  }
+
+  return {
+    toml,
+    transferServerInfo,
+  };
+}
+
+export async function getLatestBaseReserve() {
+  const response = await getServer()
+    .ledgers()
+    .order("desc")
+    .limit(1)
+    .call();
+  const baseReserve = response.records?.[0]?.base_reserve_in_stroops;
+  if (!/^\d+$/.test(String(baseReserve ?? "")) || Number(baseReserve) <= 0) {
+    throw new Error("Latest ledger did not include a valid base reserve.");
+  }
+  return String(baseReserve);
+}
+
+export async function getOpenOffers(publicKey, options = {}) {
+  return withHorizon429Backoff(async () => {
+    let page = await getServer().offers().forAccount(publicKey).limit(200).call();
+    const offers = [];
+    while (page.records.length > 0) {
+      offers.push(...page.records);
+      if (page.records.length < 200) break;
+      page = await page.next();
+    }
+    return offers;
+  }, options);
+}
+
+// --- grafted module declarations ---
+const transactionDetailRequests = new Map();

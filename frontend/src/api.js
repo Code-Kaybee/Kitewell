@@ -22,15 +22,32 @@ export async function fetchLatestHorizonLedger(horizonUrl) {
   return sequence == null ? null : Number(sequence);
 }
 
-export async function fetchAccountViaApi(publicKey) {
-  const res = await fetch(`${API_BASE}/api/account/${publicKey}`);
+export async function fetchAccountViaApi(publicKey, networkId) {
+  const params = new URLSearchParams();
+  if (networkId) params.set("network", networkId);
+  const query = params.toString();
+  const res = await fetch(
+    `${API_BASE}/api/account/${publicKey}${query ? `?${query}` : ""}`
+  );
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || "Account fetch failed");
   return data;
 }
 
-export async function fetchPaymentsViaApi(publicKey, limit = 15, cursor, options = {}) {
+export async function fetchPaymentsViaApi(
+  publicKey,
+  limit = 15,
+  cursor,
+  networkOrOptions = {}
+) {
+  const options =
+    typeof networkOrOptions === "string" ? {} : networkOrOptions || {};
+  const networkId =
+    typeof networkOrOptions === "string"
+      ? networkOrOptions
+      : options.network || null;
   const params = new URLSearchParams({ limit: String(limit) });
+  if (networkId) params.set("network", networkId);
   if (cursor) params.set("cursor", cursor);
 
   const url = `${API_BASE}/api/payments/${publicKey}?${params.toString()}`;
