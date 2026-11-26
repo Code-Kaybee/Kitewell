@@ -922,6 +922,16 @@ export async function createAccountWithFreighter(
   }
   const formattedAmount = `${whole}.${fraction.padEnd(7, "0")}`;
 
+  // Refuse early when the destination already exists; a 404 means the account
+  // is free to create.
+  try {
+    await getServer().loadAccount(destination);
+    throw new Error("Destination account already exists.");
+  } catch (error) {
+    if (error?.message === "Destination account already exists.") throw error;
+    if (error?.response?.status !== 404) throw error;
+  }
+
   const sourceAccount = await getServer().loadAccount(publicKey);
   const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
     fee: selectedFeePerOperation(),
