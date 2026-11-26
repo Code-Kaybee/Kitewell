@@ -95,6 +95,7 @@ import {
   endSponsorshipWithFreighter,
   hasEndSponsorshipAction,
 } from "./sponsorshipRevoke";
+import { checkRpcNetworkAgreement } from "./rpcNetworkCheck";
 import { decodeEnvelope, formatArgumentValue } from "./envelopeDecoder";
 import { formatSimulationFee } from "./simulationFees";
 import { mapPaymentMemo } from "./paymentMemo";
@@ -372,6 +373,11 @@ export default function App() {
 
   // Issue #666: the passphrase the RPC reports, compared with the lab's.
   const [rpcNetwork, setRpcNetwork] = useState(null);
+
+  // Contract calls are blocked when the Soroban RPC reports a passphrase that
+  // disagrees with the lab's (or when the network could not be checked).
+  // Classic Horizon payments never look at this flag.
+  const contractCallsBlocked = rpcNetwork?.contractCallsAllowed === false;
 
   // Contract instance TTL + event tail in the Lab tab.
   const [ttlInfo, setTtlInfo] = useState(null);
