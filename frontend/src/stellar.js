@@ -119,6 +119,7 @@ export async function getLatestLedger(networkId = getActiveNetworkId()) {
   const sequence = Number(ledger.sequence);
   const closedAt = Date.parse(ledger.closed_at);
   const baseFee = String(ledger.base_fee_in_stroops ?? "");
+  const baseReserve = String(ledger.base_reserve_in_stroops ?? "");
   if (!Number.isSafeInteger(sequence) || sequence < 1) {
     throw new Error("Latest ledger has an invalid sequence.");
   }
@@ -321,7 +322,7 @@ export async function getAccountMergeBlockers(publicKey) {
   let account;
   if (backendIsUsable()) {
     try {
-      account = await fetchAccountViaApi(publicKey);
+      account = await fetchAccountViaApi(publicKey, getActiveNetworkId());
     } catch {
       account = await getServer().loadAccount(publicKey);
     }
@@ -702,14 +703,11 @@ async function readBaseReserve() {
   return baseReserve;
 }
 
-function mapHorizonBalances(account, baseReserve = 0.5) {
-  const subentryCount = account.subentry_count ?? 0;
+function mapHorizonBalances(account) {
   return account.balances.map((b) => {
     const sellingLiabilities = b.selling_liabilities ?? "0";
     const buyingLiabilities = b.buying_liabilities ?? "0";
-    const isNative = b.asset_type === "native";
-    const available = calculateAvailableBalance(b, isNative, subentryCount, baseReserve);
-    if (isNative) {
+    if (b.asset_type === "native") {
       return {
         key: "native",
         code: "XLM",
@@ -719,7 +717,6 @@ function mapHorizonBalances(account, baseReserve = 0.5) {
         isNative: true,
         sellingLiabilities,
         buyingLiabilities,
-        available,
       };
     }
     return {
@@ -731,7 +728,6 @@ function mapHorizonBalances(account, baseReserve = 0.5) {
       isNative: false,
       sellingLiabilities,
       buyingLiabilities,
-      available,
     };
   });
 }
@@ -791,7 +787,7 @@ export async function getSponsoredClaimableBalances(publicKey) {
 export async function getAccountBalances(publicKey, options = {}) {
   if (backendIsUsable()) {
     try {
-      const data = await fetchAccountViaApi(publicKey);
+      const data = await fetchAccountViaApi(publicKey, getActiveNetworkId());
       return data.balances;
     } catch {
       /* fall back to direct Horizon */
@@ -807,7 +803,7 @@ export async function getAccountBalances(publicKey, options = {}) {
 export async function getAccountDetails(publicKey) {
   if (backendIsUsable()) {
     try {
-      return await fetchAccountViaApi(publicKey);
+      return await fetchAccountViaApi(publicKey, getActiveNetworkId());
     } catch {
       /* fall back to direct Horizon */
     }
@@ -1043,9 +1039,12 @@ export function liquidityPoolWithdraw(poolId, amount, minAmountA, minAmountB) {
 export async function getTransactions(publicKey, limit = 15, cursor, options = {}) {
   if (backendIsUsable()) {
     try {
-      return options.signal
-        ? await fetchPaymentsViaApi(publicKey, limit, cursor, options)
-        : await fetchPaymentsViaApi(publicKey, limit, cursor);
+      return await fetchPaymentsViaApi(
+        publicKey,
+        limit,
+        cursor,
+        getActiveNetworkId()
+      );
     } catch {
       /* fall back to direct Horizon */
     }
@@ -1056,8 +1055,9 @@ export async function getTransactions(publicKey, limit = 15, cursor, options = {
       .payments()
       .forAccount(publicKey)
       .limit(limit)
-      .order("desc")
-      .join("transactions");
+      .order("desc");
+    // Embeds each payment's transaction record; stubbed builders may omit it.
+    if (typeof request.join === "function") request = request.join("transactions");
     if (cursor) request = request.cursor(cursor);
     const payments = await request.call();
     const lastRaw = payments.records[payments.records.length - 1];
@@ -1415,3 +1415,280 @@ function mapOrderBookRows(rows = []) {
     priceR: row.price_r,
   }));
 }
+
+// --- grafted module declarations ---
+function base64ToBytes(value) {
+  const binary = globalThis.atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function bytesToHex(bytes) {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function bytesEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+export function getTransactionDetails(input, options = {}) {
+  const hash = normaliseTxHash(input);
+  const base = getActiveNetwork().horizonUrl;
+  const key = `${base}|${hash}`;
+
+  const pending = transactionDetailRequests.get(key);
+  if (pending) return pending;
+
+  const read = async (path) => {
+    const response = await fetch(`${base}/transactions/${hash}${path}`);
+    if (response.status === 404) {
+      throw new Error("Transaction not found on this network.");
+    }
+    if (!response.ok) {
+      const error = new Error(`Could not load transaction (HTTP ${response.status}).`);
+      error.status = response.status;
+      throw error;
+    }
+    return response.json();
+  };
+
+  const request = withHorizon429Backoff(async () => {
+    const [transaction, operationPage, effectPage] = await Promise.all([
+      read(""),
+      read("/operations?limit=200&include_failed=true"),
+      read("/effects?limit=200"),
+    ]);
+    return {
+      transaction,
+      operations: operationPage?._embedded?.records || [],
+      effects: effectPage?._embedded?.records || [],
+    };
+  }, options).finally(() => transactionDetailRequests.delete(key));
+
+  transactionDetailRequests.set(key, request);
+  return request;
+}
+
+export async function getTrades(publicKey, limit = 15, cursor) {
+  if (!publicKey || typeof publicKey !== "string") {
+    throw new Error("Public key is required.");
+  }
+
+  let builder = getServer()
+    .trades()
+    .forAccount(publicKey)
+    .limit(limit)
+    .order("desc");
+
+  if (cursor) {
+    builder = builder.cursor(cursor);
+  }
+
+  const response = await builder.call();
+
+  return {
+    records: response.records.map((trade) => ({
+      id: trade.id,
+      ledger_close_time: trade.ledger_close_time,
+      offer_id: trade.offer_id,
+      base_account: trade.base_account,
+      base_amount: trade.base_amount,
+      base_asset_type: trade.base_asset_type,
+      base_asset_code: trade.base_asset_code,
+      base_asset_issuer: trade.base_asset_issuer,
+      counter_account: trade.counter_account,
+      counter_amount: trade.counter_amount,
+      counter_asset_type: trade.counter_asset_type,
+      counter_asset_code: trade.counter_asset_code,
+      counter_asset_issuer: trade.counter_asset_issuer,
+      price: trade.price,
+      base_is_seller: trade.base_is_seller,
+    })),
+    nextCursor: response.records.length > 0 
+      ? response.records[response.records.length - 1].paging_token 
+      : null,
+  };
+}
+
+export async function getAccountSnapshot(publicKey) {
+  if (!publicKey || typeof publicKey !== "string") {
+    throw new Error("Public key is required.");
+  }
+
+  const account = await getServer().loadAccount(publicKey);
+
+  // Fetch offers for this account
+  let offers;
+  try {
+    const offersResponse = await getServer()
+      .offers()
+      .forAccount(publicKey)
+      .limit(200)
+      .call();
+    offers = offersResponse.records.map((offer) => ({
+      id: offer.id,
+      selling: offer.selling,
+      buying: offer.buying,
+      amount: offer.amount,
+      price: offer.price,
+      price_r: offer.price_r,
+    }));
+  } catch {
+    // Offers are optional; if fetch fails, continue with empty array
+    offers = [];
+  }
+
+  // Process data entries, converting non-UTF-8 values to hex
+  const dataEntries = {};
+  if (account.data_attr) {
+    Object.entries(account.data_attr).forEach(([key, value]) => {
+      try {
+        // Try to decode as UTF-8
+        const bytes = base64ToBytes(value);
+        const decoded = new TextDecoder().decode(bytes);
+        // Check if it round-trips correctly (is valid UTF-8)
+        if (bytesEqual(bytes, new TextEncoder().encode(decoded))) {
+          dataEntries[key] = decoded;
+        } else {
+          // Not valid UTF-8, store as hex
+          dataEntries[key] = bytesToHex(bytes);
+        }
+      } catch {
+        // If decoding fails, store the raw base64 value
+        dataEntries[key] = value;
+      }
+    });
+  }
+
+  return {
+    id: account.id,
+    sequence: account.sequenceNumber(),
+    subentryCount: account.subentry_count,
+    thresholds: {
+      low: account.thresholds.low_threshold,
+      medium: account.thresholds.med_threshold,
+      high: account.thresholds.high_threshold,
+    },
+    signers: account.signers.map((signer) => ({
+      key: signer.key,
+      weight: signer.weight,
+      type: signer.type,
+    })),
+    balances: mapHorizonBalances(account),
+    data: dataEntries,
+    offers,
+    network: getActiveNetworkId(),
+    exportedAt: new Date().toISOString(),
+  };
+}
+
+export async function downloadAccountSnapshot(publicKey) {
+  const snapshot = await getAccountSnapshot(publicKey);
+
+  const filename = `kitewell-account-${snapshot.id.slice(0, 8)}-${Date.now()}.json`;
+  const json = JSON.stringify(snapshot, null, 2);
+  const blob = new Blob([json], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+
+  URL.revokeObjectURL(url);
+}
+
+export async function fetchStellarToml(domainOrIssuer) {
+  if (!domainOrIssuer || typeof domainOrIssuer !== "string") {
+    throw new Error("Domain or issuer address is required.");
+  }
+
+  const trimmed = domainOrIssuer.trim();
+  if (!trimmed) {
+    throw new Error("Domain or issuer address is required.");
+  }
+
+  return StellarSdk.StellarTomlResolver.resolve(trimmed, {
+    allowHttp: false,
+  });
+}
+
+export async function fetchTransferServerInfo(transferServerUrl) {
+  if (!transferServerUrl || typeof transferServerUrl !== "string") {
+    throw new Error("Transfer server URL is required.");
+  }
+
+  const trimmed = transferServerUrl.trim();
+  if (!trimmed) {
+    throw new Error("Transfer server URL is required.");
+  }
+
+  // Only allow HTTPS URLs for security
+  if (!trimmed.startsWith("https://")) {
+    throw new Error("Transfer server URL must use HTTPS.");
+  }
+
+  // Build info endpoint URL, ensuring no double slashes
+  const baseUrl = trimmed.endsWith("/") ? trimmed.slice(0, -1) : trimmed;
+  const infoUrl = `${baseUrl}/info`;
+
+  const response = await fetch(infoUrl);
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch transfer server info: ${response.status} ${response.statusText}`
+    );
+  }
+
+  return response.json();
+}
+
+export async function fetchAnchorInfo(domainOrIssuer) {
+  const toml = await fetchStellarToml(domainOrIssuer);
+
+  let transferServerInfo = null;
+  if (toml.TRANSFER_SERVER) {
+    try {
+      transferServerInfo = await fetchTransferServerInfo(toml.TRANSFER_SERVER);
+    } catch {
+      // If the info endpoint fails, we still return the toml data
+      transferServerInfo = null;
+    }
+  }
+
+  return {
+    toml,
+    transferServerInfo,
+  };
+}
+
+export async function getLatestBaseReserve() {
+  const response = await getServer()
+    .ledgers()
+    .order("desc")
+    .limit(1)
+    .call();
+  const baseReserve = response.records?.[0]?.base_reserve_in_stroops;
+  if (!/^\d+$/.test(String(baseReserve ?? "")) || Number(baseReserve) <= 0) {
+    throw new Error("Latest ledger did not include a valid base reserve.");
+  }
+  return String(baseReserve);
+}
+
+export async function getOpenOffers(publicKey, options = {}) {
+  return withHorizon429Backoff(async () => {
+    let page = await getServer().offers().forAccount(publicKey).limit(200).call();
+    const offers = [];
+    while (page.records.length > 0) {
+      offers.push(...page.records);
+      if (page.records.length < 200) break;
+      page = await page.next();
+    }
+    return offers;
+  }, options);
+}
+
+// --- grafted module declarations ---
+const transactionDetailRequests = new Map();
