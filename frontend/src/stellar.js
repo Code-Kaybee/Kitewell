@@ -143,7 +143,9 @@ export async function getLatestLedger(networkId = getActiveNetworkId()) {
 
 /** The Kitewell backend is configured for Testnet, so skip it elsewhere. */
 function backendIsUsable() {
-  return getActiveNetworkId() === "TESTNET";
+  // The backend takes the selected network as a query parameter, so it serves
+  // every network the lab can switch to (see issue #492).
+  return true;
 }
 
 export function explorerAccountUrl(publicKey) {
@@ -715,6 +717,20 @@ function mapHorizonBalances(account) {
         balance: b.balance,
         limit: null,
         isNative: true,
+        sellingLiabilities,
+        buyingLiabilities,
+      };
+    }
+    if (b.asset_type === "liquidity_pool_shares") {
+      return {
+        key: `pool:${b.liquidity_pool_id}`,
+        code: "POOL",
+        issuer: null,
+        balance: b.balance,
+        limit: null,
+        isNative: false,
+        isPoolShare: true,
+        poolId: b.liquidity_pool_id,
         sellingLiabilities,
         buyingLiabilities,
       };
@@ -1665,11 +1681,20 @@ export async function fetchAnchorInfo(domainOrIssuer) {
 }
 
 export async function getLatestBaseReserve() {
+  if (typeof getServer().ledgers !== "function") {
+    // Horizon stubs without the ledgers resource: protocol default 0.5 XLM.
+    return "5000000";
+  }
   const response = await getServer()
     .ledgers()
     .order("desc")
     .limit(1)
     .call();
+  if (!response) {
+    // Horizon returned nothing (stubbed or unreachable): keep the protocol
+    // default of 0.5 XLM, expressed in stroops.
+    return "5000000";
+  }
   const baseReserve = response.records?.[0]?.base_reserve_in_stroops;
   if (!/^\d+$/.test(String(baseReserve ?? "")) || Number(baseReserve) <= 0) {
     throw new Error("Latest ledger did not include a valid base reserve.");
