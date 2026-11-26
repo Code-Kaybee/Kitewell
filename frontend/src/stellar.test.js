@@ -14,10 +14,22 @@ vi.mock("./api", () => ({
   fetchPaymentsViaApi: vi.fn(),
 }));
 
-const { loadAccountMock, paymentsCallMock, offersCallMock } = vi.hoisted(() => ({
+const {
+  loadAccountMock,
+  paymentsCallMock,
+  offersCallMock,
+  orderBookCallMock,
+  claimableCallMock,
+  assetCallMock,
+  ledgerCallMock,
+} = vi.hoisted(() => ({
   loadAccountMock: vi.fn(),
   paymentsCallMock: vi.fn(),
   offersCallMock: vi.fn(),
+  orderBookCallMock: vi.fn(),
+  claimableCallMock: vi.fn(),
+  assetCallMock: vi.fn(),
+  ledgerCallMock: vi.fn(),
 }));
 
 vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
@@ -29,6 +41,7 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
       Server: vi.fn(function () {
         return {
           loadAccount: loadAccountMock,
+          ledgers: () => ({ order: () => ({ limit: () => ({ call: ledgerCallMock }) }) }),
           offers: () => ({
             forAccount: () => ({
               order: () => ({ call: offersCallMock }),
@@ -80,6 +93,7 @@ const {
   validateDataValue,
   validateAccountMerge,
   mergeBlockersFromAccount,
+  resetHorizon429BackoffForTests,
 } = await import("./stellar");
 
 /** Minimal Horizon account payload: 3.5 XLM + an issued asset. */
